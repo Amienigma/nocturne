@@ -1,0 +1,10 @@
+{
+  "name": "nocturne",
+  "private": true,
+  "type": "module",
+  "description": "NOCTURNE × 808 PIT — browser beat lab",
+  "scripts": {
+    "test": "node --test test/smoke.mjs",
+    "start": "python3 -m http.server 4173"
+  }
+}
