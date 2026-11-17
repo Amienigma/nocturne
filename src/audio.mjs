@@ -21,15 +21,75 @@ function distortionCurve(amount) {
   return curve;
 }
 
+// Curves are pure functions of `amount`; cache them so each hit doesn't
+// allocate and fill a fresh 44,100-sample Float32Array (heavy GC churn on phones).
+const curveCache = new Map();
 function nocturneCurve(amount = 50) {
   const n = typeof amount === "number" ? amount : 50;
+  const cached = curveCache.get(n);
+  if (cached) return cached;
   const r = new Float32Array(44100);
   const l = Math.PI / 180;
   for (let u = 0; u < 44100; ++u) {
     const o = (u * 2) / 44100 - 1;
     r[u] = ((3 + n) * o * 20 * l) / (Math.PI + n * Math.abs(o));
   }
+  curveCache.set(n, r);
   return r;
+}
+
+// Loudness of a curve driven by a full-scale sine; used to level-match drive
+// settings so "more drive" means more grit, not a louder (speaker-cooking) sub.
+const curveRmsCache = new Map();
+function curveSineRms(amount) {
+  const hit = curveRmsCache.get(amount);
+  if (hit) return hit;
+  const curve = nocturneCurve(amount);
+  const n = 2048;
+  let ss = 0;
+  for (let i = 0; i < n; i++) {
+    const x = Math.sin((2 * Math.PI * i) / n);
+    const idx = Math.min(curve.length - 1, Math.round(((x + 1) / 2) * (curve.length - 1)));
+    ss += curve[idx] * curve[idx];
+  }
+  const rms = Math.sqrt(ss / n);
+  curveRmsCache.set(amount, rms);
+  return rms;
+}
+
+// ---- Speaker protection -------------------------------------------------
+// Gain staging: the mix bus is trimmed so a typical pattern peaks around
+// -6 dBFS before any limiting; a fixed makeup after the (musical) limiter
+// restores loudness, and the always-on safety stage keeps the output under
+// SAFETY_CEILING no matter what is stacked.
+export const MIX_TRIM = 0.5; // ~-6 dB: default pattern peaks near -6 dBFS here
+export const POST_GAIN_LIMITER = 0.9; // after the musical LIMITER (it has auto makeup)
+export const POST_GAIN_DIRECT = 1.28; // LIMITER off: the safety stage does the limiting
+export const SAFETY_HPF_HZ = 28;
+export const SAFETY_CEILING = 0.87; // ~-1.2 dBFS sample peak, leaves room for inter-sample peaks
+export const SUB_FLOOR_HZ = 30;
+
+// Soft-clip curve: transparent below `knee`, smooth tanh shoulder above it,
+// and the endpoints (where any input beyond +/-1 lands) never exceed the ceiling.
+function ceilingCurve(ceiling = SAFETY_CEILING, knee = 0.8 * SAFETY_CEILING) {
+  const n = 4097;
+  const curve = new Float32Array(n);
+  const room = ceiling - knee;
+  for (let i = 0; i < n; i++) {
+    const x = (i / (n - 1)) * 2 - 1;
+    const a = Math.abs(x);
+    const y = a <= knee ? a : knee + room * Math.tanh((a - knee) / room);
+    curve[i] = Math.sign(x) * Math.min(ceiling, y);
+  }
+  return curve;
+}
+
+// Fold sub-sonic fundamentals up by octaves so the note name stays the same
+// but nothing below ~30 Hz is asked of the speaker.
+export function foldSub(hz, floor = SUB_FLOOR_HZ) {
+  let f = hz;
+  while (f > 0 && f < floor) f *= 2;
+  return f;
 }
 
 export class Studio {
@@ -47,6 +107,14 @@ export class Studio {
     this.pink = null;
     this.verbShort = null;
     this.verbLong = null;
+    this.reverbSends = new Map();
+    this.out = null;
+    this.scopeTapped = false;
+    this.recTapped = false;
+    this.lastUse = 0;
+    this.keepAwake = false;
+    this.idleTimer = 0;
+    this.onActivity = () => {};
     this.mild = null;
     this.heavy = null;
     this.buses = {};
@@ -64,6 +132,10 @@ export class Studio {
     this.recorder = null;
     this.recChunks = [];
     this.lastHz = 55;
+    this.chokes = new Map();
+    this.fadeMs = 30;
+    this.idleMs = 7000; // longest one-shot (~2.6 s) + long reverb tail (4.2 s)
+    this.hiddenSuspend = false;
     this.onNotes = () => {};
     this.n808 = {
       octave: 0,
@@ -96,7 +168,10 @@ export class Studio {
         this.build();
         this.applyPatch();
       }
-      if (this.ctx.state !== "running") void this.ctx.resume();
+      this.lastUse = performance.now();
+      if (this.ctx.state !== "running" && !this.hiddenSuspend) this.resumeFaded();
+      this.armIdleCheck();
+      this.onActivity();
       return true;
     } catch {
       return false;
@@ -114,7 +189,7 @@ export class Studio {
     this.compressor.attack.value = 0.003;
     this.compressor.release.value = 0.2;
     this.analyser = ctx.createAnalyser();
-    this.analyser.fftSize = 2048;
+    this.analyser.fftSize = 1024;
     this.analyser.smoothingTimeConstant = 0.78;
     this.timeBuf = new Uint8Array(this.analyser.frequencyBinCount);
     this.freqAnalyser = ctx.createAnalyser();
@@ -123,6 +198,8 @@ export class Studio {
     this.recDest = ctx.createMediaStreamDestination();
     this.pitFilter = ctx.createBiquadFilter();
     this.pitFilter.type = "lowpass";
+    this.analyser.connect(this.freqAnalyser);
+    this.buildSafety();
     this.rewireMaster();
 
     const white = ctx.createBuffer(1, ctx.sampleRate * 2, ctx.sampleRate);
@@ -169,18 +246,197 @@ export class Studio {
     this.pitFilter.connect(this.buses["808"]);
   }
 
+  // Always-on safety stage (cannot be bypassed by the LIMITER button):
+  //   trim -> fade -> DC block -> 4th-order 28 Hz highpass -> brickwall-ish
+  //   compressor (-3 dBFS, 20:1, 1 ms) -> soft-clip ceiling (~-1 dBFS) -> out
+  // `out` feeds the speakers, the recorder and the scope taps.
+  buildSafety() {
+    const ctx = this.ctx;
+    this.trim = ctx.createGain();
+    this.trim.gain.value = MIX_TRIM;
+    this.post = ctx.createGain();
+    this.post.gain.value = POST_GAIN_DIRECT;
+    this.fade = ctx.createGain();
+    this.fade.gain.value = 1;
+    const dc = ctx.createBiquadFilter();
+    dc.type = "highpass";
+    dc.frequency.value = 5;
+    dc.Q.value = 0.5;
+    const hp1 = ctx.createBiquadFilter();
+    hp1.type = "highpass";
+    hp1.frequency.value = SAFETY_HPF_HZ;
+    hp1.Q.value = 0.5412; // two stages = 4th-order Butterworth
+    const hp2 = ctx.createBiquadFilter();
+    hp2.type = "highpass";
+    hp2.frequency.value = SAFETY_HPF_HZ;
+    hp2.Q.value = 1.3066;
+    const brick = ctx.createDynamicsCompressor();
+    brick.threshold.value = -4;
+    brick.knee.value = 0;
+    brick.ratio.value = 20;
+    brick.attack.value = 0.001;
+    brick.release.value = 0.08;
+    const ceiling = ctx.createWaveShaper();
+    ceiling.curve = ceilingCurve();
+    ceiling.oversample = "4x"; // tames aliasing / inter-sample peaks from the soft clip
+    this.post.connect(this.fade);
+    this.fade.connect(dc);
+    dc.connect(hp1);
+    hp1.connect(hp2);
+    hp2.connect(brick);
+    brick.connect(ceiling);
+    this.safetyIn = this.post;
+    this.safetyLimiter = brick;
+    this.out = ceiling;
+    this.out.connect(ctx.destination);
+  }
+
+  // Mix path: master -> trim -> (musical LIMITER, optional) -> safety stage.
+  // The analysers and the recording destination are side taps on the safety
+  // output, connected only while needed.
   rewireMaster() {
     try { this.master.disconnect(); } catch { /* first wire */ }
+    try { this.trim.disconnect(); } catch { /* first wire */ }
     try { this.compressor.disconnect(); } catch { /* first wire */ }
+    this.master.connect(this.trim);
+    const post = this.limiterOn ? POST_GAIN_LIMITER : POST_GAIN_DIRECT;
+    this.post.gain.setTargetAtTime(post, this.ctx.currentTime, 0.02);
     if (this.limiterOn) {
-      this.master.connect(this.compressor);
-      this.compressor.connect(this.analyser);
+      this.trim.connect(this.compressor);
+      this.compressor.connect(this.safetyIn);
+      this.preSafety = this.compressor;
     } else {
-      this.master.connect(this.analyser);
+      this.trim.connect(this.safetyIn);
+      this.preSafety = this.trim;
     }
-    this.analyser.connect(this.ctx.destination);
-    this.analyser.connect(this.freqAnalyser);
-    this.freqAnalyser.connect(this.recDest);
+  }
+
+  // Fade the output before suspending / after resuming so pausing never pops.
+  suspendFaded() {
+    const ctx = this.ctx;
+    if (!ctx || ctx.state !== "running") return Promise.resolve();
+    const t = ctx.currentTime;
+    const g = this.fade.gain;
+    g.cancelScheduledValues(t);
+    g.setValueAtTime(g.value, t);
+    g.linearRampToValueAtTime(0, t + this.fadeMs / 1000);
+    return new Promise((resolve) => {
+      window.setTimeout(() => {
+        // Only suspend if nothing woke the context during the fade.
+        if (this.ctx.state === "running" && this.fadingOut) void this.ctx.suspend();
+        this.fadingOut = false;
+        resolve();
+      }, this.fadeMs + 20);
+      this.fadingOut = true;
+    });
+  }
+
+  resumeFaded() {
+    const ctx = this.ctx;
+    this.fadingOut = false;
+    const g = this.fade.gain;
+    const fadeIn = () => {
+      const t = ctx.currentTime;
+      g.cancelScheduledValues(t);
+      g.setValueAtTime(Math.min(g.value, 1), t);
+      g.linearRampToValueAtTime(1, t + this.fadeMs / 1000);
+    };
+    if (ctx.state === "running") {
+      fadeIn();
+      return;
+    }
+    // Start the ramp from silence and let it run as the context comes back.
+    g.cancelScheduledValues(ctx.currentTime);
+    g.setValueAtTime(0, ctx.currentTime);
+    void ctx.resume().then(fadeIn, () => {});
+  }
+
+  // Monophonic 808 behaviour: a new hit on the same group chokes the previous
+  // one with a short fade, instead of stacking tails into huge sub peaks.
+  choke(group, when, vca, stopAll) {
+    const prev = this.chokes.get(group);
+    if (prev && prev.vca !== vca) {
+      const t = Math.max(when, prev.start);
+      prev.vca.gain.setValueAtTime(1, t);
+      prev.vca.gain.linearRampToValueAtTime(0, t + 0.012);
+      // (callers pass their dedicated choke gain as `vca`)
+      prev.stopAll(t + 0.03);
+    }
+    this.chokes.set(group, { vca, stopAll, start: when });
+  }
+
+  setScopeTap(on) {
+    on = !!on;
+    if (!this.ctx || !this.out || on === this.scopeTapped) return;
+    this.scopeTapped = on;
+    if (on) this.out.connect(this.analyser);
+    else try { this.out.disconnect(this.analyser); } catch { /* not connected */ }
+  }
+
+  setRecTap(on) {
+    on = !!on;
+    if (!this.ctx || !this.out || on === this.recTapped) return;
+    this.recTapped = on;
+    if (on) this.out.connect(this.recDest);
+    else try { this.out.disconnect(this.recDest); } catch { /* not connected */ }
+  }
+
+  // One shared ConvolverNode per (impulse, destination bus). Convolution is
+  // linear, so hit -> sendGain -> sharedConvolver sounds the same as the old
+  // hit -> ownConvolver -> gain, but costs one convolver instead of one per hit.
+  reverbSend(buffer, dest) {
+    let byDest = this.reverbSends.get(buffer);
+    if (!byDest) {
+      byDest = new Map();
+      this.reverbSends.set(buffer, byDest);
+    }
+    let conv = byDest.get(dest);
+    if (!conv) {
+      conv = this.ctx.createConvolver();
+      conv.buffer = buffer;
+      conv.connect(dest);
+      byDest.set(dest, conv);
+    }
+    return conv;
+  }
+
+  canSleep() {
+    return !this.keepAwake && !this.recorder && this.voices.size === 0 &&
+      !this.stepTimer && Object.keys(this.ambience).length === 0;
+  }
+
+  // Suspend the AudioContext once nothing has used it for a while (longest
+  // reverb tail is 4.2 s), so the phone's audio hardware can go idle.
+  armIdleCheck() {
+    if (this.idleTimer || typeof window === "undefined") return;
+    const check = () => {
+      this.idleTimer = 0;
+      if (!this.ctx || this.ctx.state !== "running") return;
+      if (this.canSleep() && performance.now() - this.lastUse > this.idleMs) {
+        void this.suspendFaded();
+        return;
+      }
+      this.idleTimer = window.setTimeout(check, 1000);
+    };
+    this.idleTimer = window.setTimeout(check, 1000);
+  }
+
+  // Page hidden: suspend immediately unless recording. Visible: resume only if
+  // the app still needs audio (playing); otherwise the next tap resumes it.
+  setHidden(hidden) {
+    if (!this.ctx) return;
+    if (hidden) {
+      if (this.recorder) return;
+      this.hiddenSuspend = true;
+      void this.suspendFaded();
+    } else {
+      this.hiddenSuspend = false;
+      if (this.keepAwake && this.ctx.state !== "running") {
+        this.resumeFaded();
+        this.lastUse = performance.now();
+        this.armIdleCheck();
+      }
+    }
   }
 
   setLimiter(on) {
@@ -207,12 +463,13 @@ export class Studio {
     this.pitFilter.Q.setTargetAtTime(Math.max(0.1, musical.q), t, 0.02);
   }
 
-  readFrame() {
+  readFrame(wantFreq = true) {
     if (!this.analyser || !this.timeBuf) {
-      return { time: new Uint8Array(1024).fill(128), freq: new Uint8Array(256), level: 0 };
+      if (!this.silentFrame) this.silentFrame = { time: new Uint8Array(512).fill(128), freq: new Uint8Array(256), level: 0 };
+      return this.silentFrame;
     }
     this.analyser.getByteTimeDomainData(this.timeBuf);
-    if (this.freqAnalyser && this.freqBuf) this.freqAnalyser.getByteFrequencyData(this.freqBuf);
+    if (wantFreq && this.freqAnalyser && this.freqBuf) this.freqAnalyser.getByteFrequencyData(this.freqBuf);
     let sum = 0;
     for (let i = 0; i < this.timeBuf.length; i++) {
       const v = (this.timeBuf[i] - 128) / 128;
@@ -310,12 +567,18 @@ export class Studio {
     const filter = this.pitFilter;
     const musical = toMusical(this.patch);
     const wave = waveOverride || musical.wave;
-    const freq = Math.max(20, midiToHz(midi));
+    const freq = foldSub(Math.max(20, midiToHz(midi)));
     const attack = Math.max(0.003, musical.attack);
     const decay = Math.max(0.01, musical.decay);
     const sustain = musical.sustain;
     const releaseTime = Math.max(0.02, musical.release);
     const env = ctx.createGain();
+    // `vca` sits after the envelope; release and choke fade it from 1 to 0, so
+    // they never have to guess the envelope's value at a future time (no clicks).
+    const vca = ctx.createGain();
+    // Separate choke gain so a choke never fights the release automation.
+    const chk = ctx.createGain();
+    vca.connect(chk);
     const peak = this.peakFor(wave, midi, velocity) * (0.4 + musical.volume * 0.8);
     env.gain.setValueAtTime(0, time);
     env.gain.linearRampToValueAtTime(peak, time + attack);
@@ -387,24 +650,30 @@ export class Studio {
       mix.connect(shaper);
       shaper.connect(env);
       env.connect(trem);
-      trem.connect(filter);
+      trem.connect(vca);
       extras.push(mix, highGain, shaper, trem, lfoDepth);
     } else {
       startOsc(wave, freq).connect(env);
     }
 
-    if (wave !== "horror") env.connect(filter);
+    if (wave !== "horror") env.connect(vca);
+    chk.connect(filter);
 
     let stopped = false;
     const release = (when) => {
       if (stopped) return;
       stopped = true;
       const t = Math.max(when, ctx.currentTime);
-      env.gain.cancelScheduledValues(t);
-      env.gain.setValueAtTime(Math.max(env.gain.value, 0.0001), t);
-      env.gain.linearRampToValueAtTime(0, t + releaseTime);
+      vca.gain.setValueAtTime(1, t);
+      vca.gain.linearRampToValueAtTime(0, t + releaseTime);
       for (const osc of oscs) {
         try { osc.stop(t + releaseTime + 0.03); } catch { /* already stopped */ }
+      }
+    };
+    const stopAll = (t) => {
+      stopped = true;
+      for (const osc of oscs) {
+        try { osc.stop(t); } catch { /* already stopped */ }
       }
     };
 
@@ -412,13 +681,15 @@ export class Studio {
     if (head) {
       head.addEventListener("ended", () => {
         try { env.disconnect(); } catch { /* gone */ }
+        try { vca.disconnect(); } catch { /* gone */ }
+        try { chk.disconnect(); } catch { /* gone */ }
         for (const node of extras) {
           try { node.disconnect(); } catch { /* gone */ }
         }
       });
     }
     this.lastHz = freq;
-    return { env, oscs, extras, release };
+    return { env, vca, chk, oscs, extras, release, stopAll };
   }
 
   peakFor(wave, midi, velocity) {
@@ -429,10 +700,12 @@ export class Studio {
     return vel * 0.3;
   }
 
-  firePit(midi, when, velocity, wave, dur) {
+  firePit(midi, when, velocity, wave, dur, chokeGroup = null) {
     if (!this.arm()) return;
     const voice = this.spawnAt(midi, when, velocity, wave);
-    if (voice) voice.release(when + Math.max(0.05, dur));
+    if (!voice) return;
+    voice.release(when + Math.max(0.05, dur));
+    if (chokeGroup) this.choke(chokeGroup, when, voice.chk, voice.stopAll);
   }
 
   startLoop(steps, stepMs, gate) {
@@ -515,8 +788,12 @@ export class Studio {
     V.type = "highpass";
     V.frequency.value = p.hp;
     const J = C.createWaveShaper();
-    J.curve = nocturneCurve(p.drive + (voice === "Distorted" ? 60 : voice === "Saturated" ? 30 : voice === "Overdriven Memphis" ? 85 : 0));
-    J.oversample = "4x";
+    const driveAmt = p.drive + (voice === "Distorted" ? 60 : voice === "Saturated" ? 30 : voice === "Overdriven Memphis" ? 85 : 0);
+    J.curve = nocturneCurve(driveAmt);
+    J.oversample = "2x";
+    // Drive makeup compensation: level-match to the default drive's loudness.
+    const driveComp = C.createGain();
+    driveComp.gain.value = Math.min(1, curveSineRms(p.drive) / curveSineRms(driveAmt));
     const kn = C.createDelay(0.5);
     kn.delayTime.value = 0.22;
     const zn = C.createGain();
@@ -525,7 +802,8 @@ export class Studio {
     if (voice === "Sub-Heavy") Ie *= 0.75;
     if (voice === "Short Punchy") Ie *= 1.1;
     if (voice === "House Sub") Ie *= 0.9;
-    const bt = this.lastHz;
+    Ie = foldSub(Ie); // e.g. Sub-Heavy on C1 (24.5 Hz) plays an octave up instead of below 30 Hz
+    const bt = foldSub(this.lastHz);
     const qu = p.glide / 1000;
     if (p.glide > 5) {
       g.frequency.setValueAtTime(bt, m);
@@ -544,33 +822,41 @@ export class Studio {
     let hold = voice === "Long Sustained" ? 0.9 : voice === "Short Punchy" ? 0.08 : 0.35;
     if (voice === "Sliding") hold = 0.6;
     const ue = p.attack, ie = p.decay, $e = p.sustain, pt = p.release;
-    I.gain.linearRampToValueAtTime(velocity * 0.95, m + ue);
-    I.gain.linearRampToValueAtTime(velocity * $e, m + ue + ie);
+    // Per-voice cap: the clean sine plus the driven layer used to sum to ~1.3x
+    // full scale per hit; 0.7 keeps a single NOCTURNE 808 under ~-1 dBFS.
+    const cap = 0.7;
+    I.gain.linearRampToValueAtTime(velocity * 0.95 * cap, m + ue);
+    I.gain.linearRampToValueAtTime(velocity * $e * cap, m + ue + ie);
     I.gain.linearRampToValueAtTime(0, m + ue + ie + hold + pt);
     g.connect(V);
     V.connect(H);
     H.connect(J);
-    J.connect(I);
+    J.connect(driveComp);
+    driveComp.connect(I);
     P.connect(I);
+    // Choke gain: a new NOCTURNE 808 hit fades this one out (mono, like an 808).
+    const chk = C.createGain();
+    I.connect(chk);
     if (p.reverb > 0.01 && this.verbShort) {
-      const er = C.createConvolver();
-      er.buffer = voice === "Dark Verb" ? this.verbLong : this.verbShort;
       const Sn = C.createGain();
       Sn.gain.value = p.reverb;
-      I.connect(er);
-      er.connect(Sn);
-      Sn.connect(y);
+      chk.connect(Sn);
+      Sn.connect(this.reverbSend(voice === "Dark Verb" ? this.verbLong : this.verbShort, y));
     }
     if (p.delay > 0.01) {
-      I.connect(kn);
+      chk.connect(kn);
       kn.connect(zn);
       zn.connect(y);
     }
-    I.connect(y);
+    chk.connect(y);
     g.start(m);
     P.start(m);
     g.stop(m + ue + ie + hold + pt + 0.1);
     P.stop(m + ue + ie + hold + pt + 0.1);
+    this.choke("n808", m, chk, (t) => {
+      try { g.stop(t); } catch { /* done */ }
+      try { P.stop(t); } catch { /* done */ }
+    });
   }
 
   playDrum(name, when, velocity = 0.9) {
@@ -625,13 +911,10 @@ export class Studio {
       H.connect(V);
       V.connect(y);
       if (name.includes("Verb") && this.verbShort) {
-        const conv = C.createConvolver();
-        conv.buffer = this.verbShort;
         const cg = C.createGain();
         cg.gain.value = 0.45;
-        I.connect(conv);
-        conv.connect(cg);
-        cg.connect(y);
+        I.connect(cg);
+        cg.connect(this.reverbSend(this.verbShort, y));
       }
       g.start(m);
       H.start(m);
@@ -752,13 +1035,10 @@ export class Studio {
     y.connect(P);
     P.connect(g);
     if (this.verbShort) {
-      const J = c.createConvolver();
-      J.buffer = this.verbShort;
       const Ce = c.createGain();
       Ce.gain.value = 0.35;
-      g.connect(J);
-      J.connect(Ce);
-      Ce.connect(dest);
+      g.connect(Ce);
+      Ce.connect(this.reverbSend(this.verbShort, dest));
     }
     g.connect(dest);
     m.start(h);
@@ -911,13 +1191,10 @@ export class Studio {
       m.connect(g);
       g.connect(y);
       if (this.verbLong) {
-        const P = c.createConvolver();
-        P.buffer = this.verbLong;
         const I = c.createGain();
         I.gain.value = 0.6;
-        y.connect(P);
-        P.connect(I);
-        I.connect(dest);
+        y.connect(I);
+        I.connect(this.reverbSend(this.verbLong, dest));
       }
       y.connect(dest);
       m.start(h);
@@ -986,13 +1263,10 @@ export class Studio {
       m.connect(y);
       y.connect(g);
       if (this.verbShort) {
-        const P = c.createConvolver();
-        P.buffer = this.verbShort;
         const I = c.createGain();
         I.gain.value = name.includes("Distant") ? 0.7 : 0.2;
-        g.connect(P);
-        P.connect(I);
-        I.connect(dest);
+        g.connect(I);
+        I.connect(this.reverbSend(this.verbShort, dest));
       }
       g.connect(dest);
       m.start(h);
@@ -1050,7 +1324,8 @@ export class Studio {
       const midi = step?.note ?? 36;
       const musical = toMusical(this.patch);
       const dur = Math.max(0.16, musical.attack + musical.decay + musical.release * 0.65 + 0.18);
-      this.firePit(midi, t, vel, wave, dur);
+      // Sequenced 808 subs are monophonic per source, like a real 808.
+      this.firePit(midi, t, vel, wave, dur, wave === "808" ? `seq:${source}` : null);
       return;
     }
     if (sourceIsN808(source)) {
@@ -1107,11 +1382,13 @@ export class Studio {
     if (!this.arm() || !this.recDest) return false;
     if (!this.recorder) {
       this.recChunks = [];
+      this.setRecTap(true);
       const rec = new MediaRecorder(this.recDest.stream);
       rec.ondataavailable = (e) => {
         if (e.data.size > 0) this.recChunks.push(e.data);
       };
       rec.onstop = () => {
+        this.setRecTap(false);
         const blob = new Blob(this.recChunks, { type: "audio/webm" });
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
