@@ -42,7 +42,7 @@
       position: sticky; top: 0; z-index: 30;
       display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between;
       padding: calc(12px + var(--safe-top)) 14px 12px;
-      background: rgba(8,8,11,.92); border-bottom: 1px solid #1c1c24; backdrop-filter: blur(16px);
+      background: #08080b; border-bottom: 1px solid #1c1c24;
     }
     .brand { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
     .brand h1 { margin: 0; font-size: 16px; letter-spacing: .12em; }
@@ -134,7 +134,7 @@
     body.waiting .armed-banner { display: block; }
   </style>
 </head>
-<body class="crt waiting">
+<body class="waiting">
   <header>
     <div class="brand">
       <h1 class="grotesk">NOCTURNE × 808 PIT</h1>
@@ -150,7 +150,7 @@
       <div class="pill"><label>VOL</label><input id="vol" type="range" min="0" max="1" step="0.01" value="0.85"></div>
       <button class="btn" id="play" type="button">PLAY</button>
       <button class="btn on" id="limiter" type="button">LIMITER</button>
-      <button class="btn on" id="crt" type="button">CRT</button>
+      <button class="btn" id="crt" type="button">CRT</button>
       <button class="btn" id="rec" type="button">○ REC</button>
     </div>
   </header>

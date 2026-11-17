@@ -53,7 +53,7 @@ const state = {
   paintChord: "cm",
   hatDiv: "1/16",
   limiter: true,
-  crt: true,
+  crt: false,
   recording: false,
   currentStep: -1,
   held: new Set(),
@@ -504,11 +504,58 @@ function renderSeq() {
     }
     root.appendChild(line);
   });
+  cacheStepColumns();
+}
+
+// Step buttons grouped by column, rebuilt only when the grid is re-rendered,
+// so the playhead never has to query the DOM while the sequencer runs.
+let stepColumns = [];
+let litStep = -1;
+
+function cacheStepColumns() {
+  stepColumns = Array.from({ length: state.length }, () => []);
+  $("seq").querySelectorAll(".seq-row").forEach((row) => {
+    row.querySelectorAll(".step").forEach((btn, i) => {
+      if (stepColumns[i]) stepColumns[i].push(btn);
+    });
+  });
+  litStep = state.currentStep;
+}
+
+function lightStep(step) {
+  if (step === litStep) return;
+  if (stepColumns[litStep]) for (const btn of stepColumns[litStep]) btn.classList.remove("now");
+  if (stepColumns[step]) for (const btn of stepColumns[step]) btn.classList.add("now");
+  litStep = step;
+  state.currentStep = step;
 }
 
 let timer = 0;
 let nextTime = 0;
 let stepIndex = 0;
+const lightTimers = new Set();
+
+function outputDelay() {
+  const c = studio.ctx;
+  return c ? (c.outputLatency || 0) + (c.baseLatency || 0) : 0;
+}
+
+// Light the step when it is actually heard, not when it is queued (up to
+// 120 ms early). One cheap timeout per step instead of a DOM sweep per tick.
+function queueLight(step, when) {
+  const ms = Math.max(0, (when + outputDelay() - studio.ctx.currentTime) * 1000);
+  const id = window.setTimeout(() => {
+    lightTimers.delete(id);
+    if (state.playing) lightStep(step);
+  }, ms);
+  lightTimers.add(id);
+}
+
+function clearLights() {
+  for (const id of lightTimers) clearTimeout(id);
+  lightTimers.clear();
+  lightStep(-1);
+}
 
 function scheduler() {
   if (!state.playing || !studio.ctx) return;
@@ -525,14 +572,10 @@ function scheduler() {
       if (!cell.on) return;
       studio.triggerSource(row.source, cell, when, cell.vel);
     });
-    state.currentStep = step;
+    queueLight(step, when);
     nextTime += stepSec;
     stepIndex = (stepIndex + 1) % state.length;
   }
-  const lights = document.querySelectorAll(".seq-row");
-  lights.forEach((row) => {
-    row.querySelectorAll(".step").forEach((btn, i) => btn.classList.toggle("now", i === state.currentStep));
-  });
 }
 
 function setPlaying(on) {
@@ -544,24 +587,80 @@ function setPlaying(on) {
     clearInterval(timer);
     timer = 0;
   }
+  studio.keepAwake = on;
   if (on) {
     nextTime = studio.ctx.currentTime + 0.05;
     stepIndex = 0;
     timer = window.setInterval(scheduler, 25);
+    kickScope();
   } else {
+    // Just move the playhead off; no need to rebuild the whole grid.
+    clearLights();
     state.currentStep = -1;
-    renderSeq();
+    // The AudioContext suspends itself once tails have rung out (studio idle check).
+    studio.lastUse = performance.now();
   }
   renderLcd();
 }
 
-function drawScopes() {
-  const frame = studio.readFrame();
+// Scope rendering only runs while there is something to show (playing, or a
+// sound was triggered in the last ~1.5 s), the page is visible and the scope is
+// on screen. It is capped at ~30 fps and draws a decimated waveform.
+const SCOPE_FRAME_MS = 1000 / 30;
+const SCOPE_POINTS = 256;
+const SCOPE_LINGER_MS = 1500;
+let scopeRaf = 0;
+let lastScopeDraw = 0;
+let scopeOnScreen = true;
+let scopeDirty = true;
+
+function scopeWanted() {
+  if (document.hidden || !scopeOnScreen || !studio.ctx) return false;
+  return state.playing || performance.now() - studio.lastUse < SCOPE_LINGER_MS;
+}
+
+function kickScope() {
+  if (scopeRaf || !scopeWanted()) return;
+  studio.setScopeTap(true);
+  scopeRaf = requestAnimationFrame(scopeTick);
+}
+
+function scopeTick(now) {
+  scopeRaf = 0;
+  if (!scopeWanted()) {
+    studio.setScopeTap(false);
+    drawScopes(true);
+    return;
+  }
+  if (now - lastScopeDraw >= SCOPE_FRAME_MS - 2) {
+    lastScopeDraw = now;
+    drawScopes(false);
+  }
+  scopeRaf = requestAnimationFrame(scopeTick);
+}
+
+function stopScope() {
+  if (scopeRaf) cancelAnimationFrame(scopeRaf);
+  scopeRaf = 0;
+  studio.setScopeTap(false);
+}
+
+const visible = (el) => el.offsetParent !== null;
+
+function drawScopes(idle) {
+  if (idle && !scopeDirty) return;
+  scopeDirty = !idle;
   const scope = $("scope");
+  const minis = [$("mini-wave"), $("mini-freq")].filter(visible);
+  const live = idle ? { time: null, freq: null, level: 0 } : studio.readFrame(minis.length === 2);
+  if (visible(scope)) drawMainScope(scope, live);
+  for (const c of minis) drawMini(c, c.id === "mini-freq", live);
+}
+
+function drawMainScope(scope, frame) {
   const dpr = Math.min(2, window.devicePixelRatio || 1);
-  const rect = scope.getBoundingClientRect();
-  const w = Math.max(1, Math.floor(rect.width * dpr));
-  const h = Math.max(1, Math.floor(rect.height * dpr));
+  const w = Math.max(1, Math.floor(scope.clientWidth * dpr));
+  const h = Math.max(1, Math.floor(scope.clientHeight * dpr));
   if (scope.width !== w || scope.height !== h) {
     scope.width = w;
     scope.height = h;
@@ -570,22 +669,30 @@ function drawScopes() {
   ctx.fillStyle = "#100c0b";
   ctx.fillRect(0, 0, w, h);
   ctx.strokeStyle = "#3d312b";
+  ctx.lineWidth = 1;
   ctx.beginPath();
   for (let i = 1; i < 4; i++) {
     ctx.moveTo(0, (h / 4) * i);
     ctx.lineTo(w * 0.94, (h / 4) * i);
   }
   ctx.stroke();
-  const time = frame.time;
   ctx.beginPath();
   ctx.strokeStyle = "#e25c4a";
   ctx.lineWidth = Math.max(1.5, dpr);
-  for (let i = 0; i < time.length; i++) {
-    const v = (time[i] - 128) / 128;
-    const x = (i / Math.max(1, time.length - 1)) * w * 0.94;
-    const y = h / 2 - v * h * 0.46;
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
+  const time = frame.time;
+  if (time) {
+    const stride = Math.max(1, Math.floor(time.length / SCOPE_POINTS));
+    const n = Math.floor(time.length / stride);
+    for (let k = 0; k < n; k++) {
+      const v = (time[k * stride] - 128) / 128;
+      const x = (k / Math.max(1, n - 1)) * w * 0.94;
+      const y = h / 2 - v * h * 0.46;
+      if (k === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+  } else {
+    ctx.moveTo(0, h / 2);
+    ctx.lineTo(w * 0.94, h / 2);
   }
   ctx.stroke();
   const meterW = Math.max(8, Math.floor(w * 0.04));
@@ -593,32 +700,56 @@ function drawScopes() {
   ctx.fillRect(w - meterW, 0, meterW, h);
   ctx.fillStyle = "#e25c4a";
   ctx.fillRect(w - meterW, h - frame.level * h, meterW, frame.level * h);
+}
 
-  const drawMini = (id, freq) => {
-    const c = $(id);
-    const g = c.getContext("2d");
-    g.clearRect(0, 0, c.width, c.height);
-    if (freq) {
-      for (let i = 0; i < frame.freq.length; i += 2) {
-        const v = frame.freq[i] / 255;
-        g.fillStyle = `rgba(${Math.floor(125 + v * 130)},249,255,0.9)`;
-        g.fillRect((i / frame.freq.length) * c.width, c.height - v * c.height, (c.width / frame.freq.length) * 1.6, v * c.height);
-      }
+function drawMini(c, isFreq, frame) {
+  const g = c.getContext("2d");
+  g.clearRect(0, 0, c.width, c.height);
+  if (isFreq) {
+    if (!frame.freq) return;
+    g.fillStyle = "rgba(190,249,255,0.9)";
+    const len = frame.freq.length;
+    for (let i = 0; i < len; i += 2) {
+      const v = frame.freq[i] / 255;
+      if (v <= 0) continue;
+      g.fillRect((i / len) * c.width, c.height - v * c.height, (c.width / len) * 1.6, v * c.height);
+    }
+  } else {
+    g.strokeStyle = "#7df9ff";
+    g.beginPath();
+    const time = frame.time;
+    if (!time) {
+      g.moveTo(0, c.height / 2);
+      g.lineTo(c.width, c.height / 2);
     } else {
-      g.strokeStyle = "#7df9ff";
-      g.beginPath();
-      for (let i = 0; i < time.length; i++) {
-        const x = (i / time.length) * c.width;
-        const y = ((time[i] / 128 - 1) * c.height * 0.5) + c.height / 2;
-        if (i === 0) g.moveTo(x, y);
+      const stride = Math.max(1, Math.floor(time.length / 128));
+      const n = Math.floor(time.length / stride);
+      for (let k = 0; k < n; k++) {
+        const x = (k / n) * c.width;
+        const y = ((time[k * stride] / 128 - 1) * c.height * 0.5) + c.height / 2;
+        if (k === 0) g.moveTo(x, y);
         else g.lineTo(x, y);
       }
-      g.stroke();
     }
-  };
-  drawMini("mini-wave", false);
-  drawMini("mini-freq", true);
-  requestAnimationFrame(drawScopes);
+    g.stroke();
+  }
+}
+
+function initScopeWatchers() {
+  studio.onActivity = kickScope;
+  if ("IntersectionObserver" in window) {
+    new IntersectionObserver((entries) => {
+      scopeOnScreen = entries.some((e) => e.isIntersecting);
+      if (scopeOnScreen) kickScope();
+    }).observe($("scope"));
+  }
+  document.addEventListener("visibilitychange", () => {
+    studio.setHidden(document.hidden);
+    if (document.hidden) stopScope();
+    else kickScope();
+  });
+  scopeDirty = true;
+  drawScopes(true);
 }
 
 function bind() {
@@ -750,5 +881,5 @@ renderPresets();
 renderPaint();
 renderSeq();
 bind();
-requestAnimationFrame(drawScopes);
+initScopeWatchers();
 $("toast").textContent = "NOCTURNE keep: synth keyboard, trap drums, banks, 12-track sequencer, swing, mute/solo, presets, limiter, CRT, REC. 808 PIT: Atlanta/Memphis pads, waveform, filter, ADSR, scope, sequenceable notes and chords.";

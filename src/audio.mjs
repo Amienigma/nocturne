@@ -21,14 +21,20 @@ function distortionCurve(amount) {
   return curve;
 }
 
+// Curves are pure functions of `amount`; cache them so each hit doesn't
+// allocate and fill a fresh 44,100-sample Float32Array (heavy GC churn on phones).
+const curveCache = new Map();
 function nocturneCurve(amount = 50) {
   const n = typeof amount === "number" ? amount : 50;
+  const cached = curveCache.get(n);
+  if (cached) return cached;
   const r = new Float32Array(44100);
   const l = Math.PI / 180;
   for (let u = 0; u < 44100; ++u) {
     const o = (u * 2) / 44100 - 1;
     r[u] = ((3 + n) * o * 20 * l) / (Math.PI + n * Math.abs(o));
   }
+  curveCache.set(n, r);
   return r;
 }
 
@@ -47,6 +53,14 @@ export class Studio {
     this.pink = null;
     this.verbShort = null;
     this.verbLong = null;
+    this.reverbSends = new Map();
+    this.out = null;
+    this.scopeTapped = false;
+    this.recTapped = false;
+    this.lastUse = 0;
+    this.keepAwake = false;
+    this.idleTimer = 0;
+    this.onActivity = () => {};
     this.mild = null;
     this.heavy = null;
     this.buses = {};
@@ -64,6 +78,8 @@ export class Studio {
     this.recorder = null;
     this.recChunks = [];
     this.lastHz = 55;
+    this.idleMs = 7000; // longest one-shot (~2.6 s) + long reverb tail (4.2 s)
+    this.hiddenSuspend = false;
     this.onNotes = () => {};
     this.n808 = {
       octave: 0,
@@ -96,7 +112,10 @@ export class Studio {
         this.build();
         this.applyPatch();
       }
-      if (this.ctx.state !== "running") void this.ctx.resume();
+      this.lastUse = performance.now();
+      if (this.ctx.state !== "running" && !this.hiddenSuspend) void this.ctx.resume();
+      this.armIdleCheck();
+      this.onActivity();
       return true;
     } catch {
       return false;
@@ -114,7 +133,7 @@ export class Studio {
     this.compressor.attack.value = 0.003;
     this.compressor.release.value = 0.2;
     this.analyser = ctx.createAnalyser();
-    this.analyser.fftSize = 2048;
+    this.analyser.fftSize = 1024;
     this.analyser.smoothingTimeConstant = 0.78;
     this.timeBuf = new Uint8Array(this.analyser.frequencyBinCount);
     this.freqAnalyser = ctx.createAnalyser();
@@ -123,6 +142,7 @@ export class Studio {
     this.recDest = ctx.createMediaStreamDestination();
     this.pitFilter = ctx.createBiquadFilter();
     this.pitFilter.type = "lowpass";
+    this.analyser.connect(this.freqAnalyser);
     this.rewireMaster();
 
     const white = ctx.createBuffer(1, ctx.sampleRate * 2, ctx.sampleRate);
@@ -169,18 +189,95 @@ export class Studio {
     this.pitFilter.connect(this.buses["808"]);
   }
 
+  // Output path: master -> (compressor) -> destination. The analysers and the
+  // recording destination are side taps that are only connected while needed,
+  // so an idle scope or an unused recorder costs nothing on the audio thread.
   rewireMaster() {
     try { this.master.disconnect(); } catch { /* first wire */ }
     try { this.compressor.disconnect(); } catch { /* first wire */ }
     if (this.limiterOn) {
       this.master.connect(this.compressor);
-      this.compressor.connect(this.analyser);
+      this.out = this.compressor;
     } else {
-      this.master.connect(this.analyser);
+      this.out = this.master;
     }
-    this.analyser.connect(this.ctx.destination);
-    this.analyser.connect(this.freqAnalyser);
-    this.freqAnalyser.connect(this.recDest);
+    this.out.connect(this.ctx.destination);
+    if (this.scopeTapped) this.out.connect(this.analyser);
+    if (this.recTapped) this.out.connect(this.recDest);
+  }
+
+  setScopeTap(on) {
+    on = !!on;
+    if (!this.ctx || !this.out || on === this.scopeTapped) return;
+    this.scopeTapped = on;
+    if (on) this.out.connect(this.analyser);
+    else try { this.out.disconnect(this.analyser); } catch { /* not connected */ }
+  }
+
+  setRecTap(on) {
+    on = !!on;
+    if (!this.ctx || !this.out || on === this.recTapped) return;
+    this.recTapped = on;
+    if (on) this.out.connect(this.recDest);
+    else try { this.out.disconnect(this.recDest); } catch { /* not connected */ }
+  }
+
+  // One shared ConvolverNode per (impulse, destination bus). Convolution is
+  // linear, so hit -> sendGain -> sharedConvolver sounds the same as the old
+  // hit -> ownConvolver -> gain, but costs one convolver instead of one per hit.
+  reverbSend(buffer, dest) {
+    let byDest = this.reverbSends.get(buffer);
+    if (!byDest) {
+      byDest = new Map();
+      this.reverbSends.set(buffer, byDest);
+    }
+    let conv = byDest.get(dest);
+    if (!conv) {
+      conv = this.ctx.createConvolver();
+      conv.buffer = buffer;
+      conv.connect(dest);
+      byDest.set(dest, conv);
+    }
+    return conv;
+  }
+
+  canSleep() {
+    return !this.keepAwake && !this.recorder && this.voices.size === 0 &&
+      !this.stepTimer && Object.keys(this.ambience).length === 0;
+  }
+
+  // Suspend the AudioContext once nothing has used it for a while (longest
+  // reverb tail is 4.2 s), so the phone's audio hardware can go idle.
+  armIdleCheck() {
+    if (this.idleTimer || typeof window === "undefined") return;
+    const check = () => {
+      this.idleTimer = 0;
+      if (!this.ctx || this.ctx.state !== "running") return;
+      if (this.canSleep() && performance.now() - this.lastUse > this.idleMs) {
+        void this.ctx.suspend();
+        return;
+      }
+      this.idleTimer = window.setTimeout(check, 1000);
+    };
+    this.idleTimer = window.setTimeout(check, 1000);
+  }
+
+  // Page hidden: suspend immediately unless recording. Visible: resume only if
+  // the app still needs audio (playing); otherwise the next tap resumes it.
+  setHidden(hidden) {
+    if (!this.ctx) return;
+    if (hidden) {
+      if (this.recorder) return;
+      this.hiddenSuspend = true;
+      if (this.ctx.state === "running") void this.ctx.suspend();
+    } else {
+      this.hiddenSuspend = false;
+      if (this.keepAwake && this.ctx.state !== "running") {
+        void this.ctx.resume();
+        this.lastUse = performance.now();
+        this.armIdleCheck();
+      }
+    }
   }
 
   setLimiter(on) {
@@ -207,12 +304,13 @@ export class Studio {
     this.pitFilter.Q.setTargetAtTime(Math.max(0.1, musical.q), t, 0.02);
   }
 
-  readFrame() {
+  readFrame(wantFreq = true) {
     if (!this.analyser || !this.timeBuf) {
-      return { time: new Uint8Array(1024).fill(128), freq: new Uint8Array(256), level: 0 };
+      if (!this.silentFrame) this.silentFrame = { time: new Uint8Array(512).fill(128), freq: new Uint8Array(256), level: 0 };
+      return this.silentFrame;
     }
     this.analyser.getByteTimeDomainData(this.timeBuf);
-    if (this.freqAnalyser && this.freqBuf) this.freqAnalyser.getByteFrequencyData(this.freqBuf);
+    if (wantFreq && this.freqAnalyser && this.freqBuf) this.freqAnalyser.getByteFrequencyData(this.freqBuf);
     let sum = 0;
     for (let i = 0; i < this.timeBuf.length; i++) {
       const v = (this.timeBuf[i] - 128) / 128;
@@ -516,7 +614,7 @@ export class Studio {
     V.frequency.value = p.hp;
     const J = C.createWaveShaper();
     J.curve = nocturneCurve(p.drive + (voice === "Distorted" ? 60 : voice === "Saturated" ? 30 : voice === "Overdriven Memphis" ? 85 : 0));
-    J.oversample = "4x";
+    J.oversample = "2x";
     const kn = C.createDelay(0.5);
     kn.delayTime.value = 0.22;
     const zn = C.createGain();
@@ -553,13 +651,10 @@ export class Studio {
     J.connect(I);
     P.connect(I);
     if (p.reverb > 0.01 && this.verbShort) {
-      const er = C.createConvolver();
-      er.buffer = voice === "Dark Verb" ? this.verbLong : this.verbShort;
       const Sn = C.createGain();
       Sn.gain.value = p.reverb;
-      I.connect(er);
-      er.connect(Sn);
-      Sn.connect(y);
+      I.connect(Sn);
+      Sn.connect(this.reverbSend(voice === "Dark Verb" ? this.verbLong : this.verbShort, y));
     }
     if (p.delay > 0.01) {
       I.connect(kn);
@@ -625,13 +720,10 @@ export class Studio {
       H.connect(V);
       V.connect(y);
       if (name.includes("Verb") && this.verbShort) {
-        const conv = C.createConvolver();
-        conv.buffer = this.verbShort;
         const cg = C.createGain();
         cg.gain.value = 0.45;
-        I.connect(conv);
-        conv.connect(cg);
-        cg.connect(y);
+        I.connect(cg);
+        cg.connect(this.reverbSend(this.verbShort, y));
       }
       g.start(m);
       H.start(m);
@@ -752,13 +844,10 @@ export class Studio {
     y.connect(P);
     P.connect(g);
     if (this.verbShort) {
-      const J = c.createConvolver();
-      J.buffer = this.verbShort;
       const Ce = c.createGain();
       Ce.gain.value = 0.35;
-      g.connect(J);
-      J.connect(Ce);
-      Ce.connect(dest);
+      g.connect(Ce);
+      Ce.connect(this.reverbSend(this.verbShort, dest));
     }
     g.connect(dest);
     m.start(h);
@@ -911,13 +1000,10 @@ export class Studio {
       m.connect(g);
       g.connect(y);
       if (this.verbLong) {
-        const P = c.createConvolver();
-        P.buffer = this.verbLong;
         const I = c.createGain();
         I.gain.value = 0.6;
-        y.connect(P);
-        P.connect(I);
-        I.connect(dest);
+        y.connect(I);
+        I.connect(this.reverbSend(this.verbLong, dest));
       }
       y.connect(dest);
       m.start(h);
@@ -986,13 +1072,10 @@ export class Studio {
       m.connect(y);
       y.connect(g);
       if (this.verbShort) {
-        const P = c.createConvolver();
-        P.buffer = this.verbShort;
         const I = c.createGain();
         I.gain.value = name.includes("Distant") ? 0.7 : 0.2;
-        g.connect(P);
-        P.connect(I);
-        I.connect(dest);
+        g.connect(I);
+        I.connect(this.reverbSend(this.verbShort, dest));
       }
       g.connect(dest);
       m.start(h);
@@ -1107,11 +1190,13 @@ export class Studio {
     if (!this.arm() || !this.recDest) return false;
     if (!this.recorder) {
       this.recChunks = [];
+      this.setRecTap(true);
       const rec = new MediaRecorder(this.recDest.stream);
       rec.ondataavailable = (e) => {
         if (e.data.size > 0) this.recChunks.push(e.data);
       };
       rec.onstop = () => {
+        this.setRecTap(false);
         const blob = new Blob(this.recChunks, { type: "audio/webm" });
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
