@@ -173,6 +173,9 @@ export class Studio {
   }
 
   arm() {
+    // Offline (WAV export) studios own a pre-made OfflineAudioContext: no
+    // resume, idle-suspend or UI callbacks.
+    if (this.offline) return this.ctx !== null;
     if (typeof window === "undefined") return false;
     try {
       if (!this.ctx) {
@@ -209,7 +212,7 @@ export class Studio {
     this.freqAnalyser = ctx.createAnalyser();
     this.freqAnalyser.fftSize = 512;
     this.freqBuf = new Uint8Array(this.freqAnalyser.frequencyBinCount);
-    this.recDest = ctx.createMediaStreamDestination();
+    this.recDest = typeof ctx.createMediaStreamDestination === "function" ? ctx.createMediaStreamDestination() : null;
     this.pitFilter = ctx.createBiquadFilter();
     this.pitFilter.type = "lowpass";
     this.analyser.connect(this.freqAnalyser);
@@ -316,6 +319,12 @@ export class Studio {
     this.metroBus.connect(this.speakerSum);
     this.speakerSum.connect(clamp);
     clamp.connect(ctx.destination);
+    // Same hard ceiling on the recording path, so REC files also stay under
+    // -1.2 dBFS sample peak even when the soft clip overshoots slightly.
+    this.recClamp = ctx.createWaveShaper();
+    this.recClamp.curve = hardCeilingCurve(SAFETY_CEILING);
+    this.recClamp.oversample = "none";
+    if (this.recDest) this.recClamp.connect(this.recDest);
   }
 
   // Mix path: master -> trim -> (musical LIMITER, optional) -> safety stage.
@@ -402,10 +411,10 @@ export class Studio {
 
   setRecTap(on) {
     on = !!on;
-    if (!this.ctx || !this.out || on === this.recTapped) return;
+    if (!this.ctx || !this.out || !this.recDest || on === this.recTapped) return;
     this.recTapped = on;
-    if (on) this.out.connect(this.recDest);
-    else try { this.out.disconnect(this.recDest); } catch { /* not connected */ }
+    if (on) this.out.connect(this.recClamp);
+    else try { this.out.disconnect(this.recClamp); } catch { /* not connected */ }
   }
 
   // One shared ConvolverNode per (impulse, destination bus). Convolution is

@@ -5,9 +5,16 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>NOCTURNE × 808 PIT — Browser Beat Lab</title>
   <meta name="description" content="NOCTURNE sequencing plus 808 PIT sound design: Atlanta 808 subs, Memphis chords, filter, envelope, waveform and a 12-track step sequencer. All sounds synthesized with Web Audio.">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+  <meta name="theme-color" content="#060608">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="NOCTURNE">
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="icon" type="image/png" sizes="32x32" href="./icons/favicon-32.png">
+  <link rel="apple-touch-icon" href="./icons/apple-touch-icon.png">
+  <link rel="preload" href="./fonts/jetbrains-mono-latin.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="./fonts/fonts.css">
   <style>
     :root {
       --bg: #060608;
@@ -63,7 +70,9 @@
     }
     .btn.on { background: var(--orange); color: #111; border-color: var(--orange); }
     .btn.pit.on { background: var(--pit); border-color: var(--pit); }
-    main { padding: 14px 14px calc(28px + var(--safe-bottom)); display: grid; gap: 14px; }
+    main { padding: 14px 14px calc(28px + var(--safe-bottom)); display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; }
+    main > *, .grid-2 > * { min-width: 0; }
+    h2 { overflow-wrap: anywhere; }
     section.panel { background: #0c0c10; border: 1px solid #1e1e28; border-radius: 16px; padding: 14px; }
     .row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 12px; }
     h2 { margin: 0; font-size: 13px; letter-spacing: .18em; }
@@ -90,7 +99,8 @@
     .wave.on, .tab.on, .pad.on { background: var(--pit); border-color: var(--pit); color: #140807; }
     .knobs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 12px; }
     @media (min-width: 720px) { .knobs { grid-template-columns: repeat(6, 1fr); } }
-    .knob { display: flex; flex-direction: column; gap: 4px; font-size: 10px; color: var(--muted); }
+    .knob { display: flex; flex-direction: column; gap: 4px; font-size: 10px; color: var(--muted); min-width: 0; }
+    .knob input[type=range] { width: 100%; min-width: 0; }
     .knob span.val { color: #d8d8e2; }
     .tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 14px 0 10px; }
     .tab { min-height: 44px; }
@@ -113,8 +123,40 @@
     .subhead { color: var(--muted); font-size: 10px; letter-spacing: .16em; margin: 12px 0 8px; }
     .seq-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
     .seq { min-width: 720px; display: grid; gap: 4px; }
-    .seq-row { display: grid; grid-template-columns: 168px repeat(var(--steps, 16), minmax(28px, 1fr)); gap: 4px; align-items: center; }
-    .track-meta { display: grid; grid-template-columns: 22px 22px 1fr; gap: 4px; align-items: center; }
+    .seq-row { display: grid; grid-template-columns: 168px repeat(var(--steps, 16), minmax(28px, 1fr)); gap: 4px; align-items: center; border-radius: 8px; }
+    .seq-row.sel { background: #15151d; }
+    .track-meta { display: grid; grid-template-columns: 22px 22px minmax(0, 1fr); gap: 4px; align-items: center; }
+    .trk { border: 1px solid var(--border); background: #18181e; color: var(--fg); border-radius: 6px; height: 28px; padding: 0 6px; font-size: 9px; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
+    .seq-row.sel .trk { border-color: var(--pit); color: #ffd9d3; }
+    .track-bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 10px; }
+    .track-bar select { background: #0b0b10; color: var(--fg); border: 1px solid var(--border); border-radius: 8px; padding: 6px 8px; font-size: 11px; min-width: 0; max-width: 100%; }
+    .track-bar .ms { width: 34px; height: 34px; font-size: 11px; }
+    .track-bar .arrow { padding: 6px 12px; }
+    #trk-src { flex: 1 1 140px; }
+    .tools { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .tools label { display: flex; gap: 6px; align-items: center; color: var(--muted); font-size: 10px; letter-spacing: .12em; }
+    .tools select, .tools input[type=text] { background: #0b0b10; color: var(--fg); border: 1px solid var(--border); border-radius: 8px; padding: 8px; font-size: 12px; min-width: 0; }
+    #ai-prompt { flex: 1 1 220px; }
+    progress { accent-color: var(--cyan); width: 120px; }
+    footer { padding: 0 14px calc(20px + var(--safe-bottom)); color: var(--muted); font-size: 11px; text-align: center; }
+    footer a, .hint a { color: var(--cyan); }
+    /* Phone: focus-track view. One track at a time as big pads, 4 per row
+       (16 steps = 4×4). Swipe left/right or use ◀ ▶ to change track. */
+    @media (max-width: 600px) {
+      .seq-wrap { overflow: visible; touch-action: pan-y; }
+      .seq { min-width: 0; }
+      .seq-row { display: none; }
+      .seq-row.sel { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; background: none; }
+      .seq-row.sel .track-meta { display: none; }
+      .seq-row.sel .step { height: 64px; border-radius: 12px; font-size: 12px; }
+      .seq-row.sel .step.beat { box-shadow: inset 0 0 0 2px #3a3a48; }
+      header { gap: 8px; }
+      .controls { gap: 6px; }
+      .pill { padding: 5px 8px; gap: 6px; }
+      .pill input[type=range] { width: 84px; }
+      .btn { padding: 8px 11px; }
+    }
+    @media (min-width: 601px) { .track-bar .arrow { display: none; } }
     .ms {
       width: 22px; height: 28px; border-radius: 6px; border: 1px solid var(--border);
       background: #18181e; color: var(--muted); font-size: 9px; padding: 0; cursor: pointer;
@@ -264,14 +306,46 @@
         <button class="btn" id="slot-load" type="button">LOAD</button>
         <button class="btn" id="slot-del" type="button">DELETE</button>
       </div>
-      <p class="hint">Select a track, pick a note or chord, then tap steps. Hold, right-click or shift-click a step to cycle its velocity (40 → 60 → 80 → 100%); brighter = louder. Everything autosaves; CLEAR, RANDOMIZE and presets can be undone. 808 and chord tracks store a pitch per step.</p>
+      <div class="track-bar" id="track-bar">
+        <button class="btn arrow" id="trk-prev" type="button" aria-label="Previous track">◀</button>
+        <select id="trk-pick" aria-label="Track"></select>
+        <button class="btn arrow" id="trk-next" type="button" aria-label="Next track">▶</button>
+        <button class="ms" id="trk-mute" type="button" aria-label="Mute selected track">M</button>
+        <button class="ms" id="trk-solo" type="button" aria-label="Solo selected track">S</button>
+        <select id="trk-src" aria-label="Sound for selected track"></select>
+      </div>
+      <p class="hint">Select a track, pick a note or chord, then tap steps. On a phone you see one track at a time: swipe or use ◀ ▶ to switch ([ and ] on a keyboard). Hold, right-click or shift-click a step to cycle its velocity (40 → 60 → 80 → 100%); brighter = louder. Everything autosaves; CLEAR, RANDOMIZE and presets can be undone. 808 and chord tracks store a pitch per step.</p>
       <div class="note-strip" id="paint-notes"></div>
-      <div class="seq-wrap">
+      <div class="seq-wrap" id="seq-wrap">
         <div class="seq" id="seq"></div>
       </div>
       <p id="toast"></p>
     </section>
+
+    <section class="panel" id="tools">
+      <div class="row">
+        <h2 class="grotesk">EXPORT <span>CLEAN 48 kHz STEREO WAV · NO METRONOME</span></h2>
+      </div>
+      <div class="tools">
+        <label for="exp-bars">BARS <select id="exp-bars"><option value="1">1</option><option value="2">2</option><option value="4" selected>4</option><option value="8">8</option></select></label>
+        <label for="exp-bits">FORMAT <select id="exp-bits"><option value="16" selected>16-bit</option><option value="24">24-bit</option></select></label>
+        <button class="btn" id="export" type="button">EXPORT WAV</button>
+        <progress id="exp-prog" max="1" value="0" hidden></progress>
+        <span class="hint" id="exp-status" role="status" aria-live="polite"></span>
+      </div>
+      <p class="hint">Rendered offline through the same limiter and speaker-safety chain, so it never glitches, even on a busy phone. Reverb and 808 tails are included. On iPhone it opens the share sheet (Save to Files, AirDrop, …).</p>
+
+      <div class="row" style="margin-top:18px">
+        <h2 class="grotesk">DESCRIBE A BEAT <span>WRITTEN BY AMIENIGMA AI</span></h2>
+      </div>
+      <form class="tools" id="ai-form">
+        <input id="ai-prompt" type="text" maxlength="300" placeholder="e.g. dark Memphis trap, 140, sliding 808s" aria-label="Describe a beat" autocomplete="off">
+        <button class="btn" id="ai-go" type="submit">WRITE BEAT</button>
+      </form>
+      <p class="hint" id="ai-status" role="status" aria-live="polite">Loads as one undoable step. Your sound settings and metronome stay as they are.</p>
+    </section>
   </main>
+  <footer>Made with NOCTURNE × 808 PIT · beats written by <a href="https://amienigma-llm.vercel.app/" target="_blank" rel="noopener">Amienigma AI</a></footer>
   <div id="snack" role="status" aria-live="polite" hidden><span id="snack-msg"></span><button class="mini" id="snack-undo" type="button">UNDO</button></div>
   <script type="module" src="./app.js"></script>
 </body>
