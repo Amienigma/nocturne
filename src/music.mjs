@@ -22,16 +22,21 @@ export const KEYBOARD_NOTES = [
   "C3", "C#3", "D3", "D#3", "E3", "F3", "F#3", "G3", "G#3", "A3", "A#3", "B3", "C4",
 ];
 
+// Drums live on the number row so every synth key (including the black keys
+// W E T Y U) stays playable from the computer keyboard.
 export const DRUM_KEYS = {
-  q: "Hard Kick",
-  w: "Sub Kick",
-  e: "Distorted Kick",
-  r: "Sharp Snare",
-  t: "Memphis Snare",
-  y: "Dry Clap",
-  u: "Closed Hat",
-  i: "Open Hat",
+  1: "Hard Kick",
+  2: "Sub Kick",
+  3: "Distorted Kick",
+  4: "Sharp Snare",
+  5: "Memphis Snare",
+  6: "Dry Clap",
+  7: "Closed Hat",
+  8: "Open Hat",
 };
+
+// Step velocity levels; long-press / right-click / shift-click cycles through them.
+export const VEL_LEVELS = [0.4, 0.6, 0.8, 1];
 
 export const ATT_MIN = 0.003;
 export const ATT_MAX = 1.5;
@@ -407,7 +412,21 @@ export function nudgeStepVelocity(pattern, track, step, delta = 0.12) {
     if (i !== track) return row;
     const steps = row.steps.map((cell, j) => {
       if (j !== step) return cell;
-      return { ...cell, on: true, vel: clamp01((cell.on ? cell.vel : 0.7) + delta) };
+      return { ...cell, on: true, vel: Math.round(clamp01((cell.on ? cell.vel : 0.7) + delta) * 100) / 100 };
+    });
+    return { ...row, steps };
+  });
+}
+
+/** Cycle a step through VEL_LEVELS (wrapping back to the quietest), turning it on if needed. */
+export function cycleStepVelocity(pattern, track, step) {
+  return pattern.map((row, i) => {
+    if (i !== track) return row;
+    const steps = row.steps.map((cell, j) => {
+      if (j !== step) return cell;
+      if (!cell.on) return { ...cell, on: true, vel: VEL_LEVELS[VEL_LEVELS.length - 1] };
+      const next = VEL_LEVELS.find((l) => l > cell.vel + 0.001) ?? VEL_LEVELS[0];
+      return { ...cell, vel: next };
     });
     return { ...row, steps };
   });
@@ -434,7 +453,7 @@ export function randomizePattern(pattern, length = 16) {
       return {
         ...cell,
         on,
-        vel: 0.55 + Math.random() * 0.4,
+        vel: Math.round((0.55 + Math.random() * 0.4) * 100) / 100,
       };
     }),
   }));
