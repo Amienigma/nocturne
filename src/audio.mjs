@@ -132,6 +132,14 @@ export class Studio {
     this.mild = null;
     this.heavy = null;
     this.buses = {};
+    // Per-track mixer (sequenced voices only): strips are created on first use.
+    this.mix = [];
+    this.strips = [];
+    this.sends = null; // shared reverb + delay return buses, created on first send
+    this.sendBpm = 100;
+    this.route = null; // strip the voice being triggered right now goes to
+    this.glide = null; // { fromHz, sec } while triggering a slid step
+    this.trackHz = new Map();
     this.limiterOn = true;
     this.masterGain = 0.85;
     this.patch = { ...DEFAULT_PATCH };
@@ -146,6 +154,7 @@ export class Studio {
     this.recorder = null;
     this.recChunks = [];
     this.lastHz = 55;
+    this.gateSec = 0;
     this.chokes = new Map();
     this.fadeMs = 30;
     this.idleMs = 7000; // longest one-shot (~2.6 s) + long reverb tail (4.2 s)
@@ -495,8 +504,127 @@ export class Studio {
     const musical = toMusical(this.patch);
     const t = this.ctx.currentTime;
     const hz = Math.min(18000, Math.max(40, musical.cutoffHz));
-    this.pitFilter.frequency.setTargetAtTime(hz, t, 0.02);
-    this.pitFilter.Q.setTargetAtTime(Math.max(0.1, musical.q), t, 0.02);
+    for (const f of [this.pitFilter, ...this.strips.map((st) => st?.pit).filter(Boolean)]) {
+      f.frequency.setTargetAtTime(hz, t, 0.02);
+      f.Q.setTargetAtTime(Math.max(0.1, musical.q), t, 0.02);
+    }
+  }
+
+  // ---- Per-track mixer ----------------------------------------------------
+  // strip: in (gain, forced stereo so mono voices keep their level) -> pan -> master
+  //                                                       pan -> rev send / dly send
+  // Sequenced voices go to their track's strip; pads, keys and MIDI keep the
+  // category buses. Unity defaults sound exactly like the category buses.
+  busFor(name) {
+    if (this.route) return this.route.in;
+    return this.buses[name] || this.master;
+  }
+
+  strip(track) {
+    if (!this.ctx || !Number.isInteger(track) || track < 0) return null;
+    let st = this.strips[track];
+    if (st) return st;
+    const ctx = this.ctx;
+    const input = ctx.createGain();
+    input.channelCount = 2;
+    input.channelCountMode = "explicit";
+    const pan = ctx.createStereoPanner();
+    input.connect(pan);
+    pan.connect(this.master);
+    st = { in: input, pan, rev: null, dly: null, pit: null };
+    this.strips[track] = st;
+    this.applyMix(track);
+    return st;
+  }
+
+  stripPit(st) {
+    if (!st.pit) {
+      const f = this.ctx.createBiquadFilter();
+      f.type = "lowpass";
+      f.frequency.value = this.pitFilter.frequency.value;
+      f.Q.value = this.pitFilter.Q.value;
+      f.connect(st.in);
+      st.pit = f;
+      this.applyPatch();
+    }
+    return st.pit;
+  }
+
+  ensureSends() {
+    if (this.sends || !this.ctx) return this.sends;
+    const ctx = this.ctx;
+    const rev = ctx.createGain();
+    const conv = ctx.createConvolver();
+    conv.buffer = this.verbLong;
+    const revRet = ctx.createGain();
+    revRet.gain.value = 0.5;
+    rev.connect(conv);
+    conv.connect(revRet);
+    revRet.connect(this.master);
+    // Tempo-synced dotted-eighth ping with a darkening feedback loop.
+    const dly = ctx.createGain();
+    const delay = ctx.createDelay(2);
+    const fb = ctx.createGain();
+    fb.gain.value = 0.38;
+    const tone = ctx.createBiquadFilter();
+    tone.type = "lowpass";
+    tone.frequency.value = 3200;
+    const dlyRet = ctx.createGain();
+    dlyRet.gain.value = 0.6;
+    dly.connect(delay);
+    delay.connect(tone);
+    tone.connect(fb);
+    fb.connect(delay);
+    tone.connect(dlyRet);
+    dlyRet.connect(this.master);
+    this.sends = { rev, conv, revRet, dly, delay, fb, tone, dlyRet };
+    this.setSendTempo(this.sendBpm);
+    return this.sends;
+  }
+
+  setSendTempo(bpm) {
+    this.sendBpm = bpm;
+    if (!this.sends) return;
+    const sec = Math.min(1.5, (60 / bpm) * 0.75);
+    this.sends.delay.delayTime.setTargetAtTime(sec, this.ctx.currentTime, 0.05);
+    if (this.offline) this.sends.delay.delayTime.value = sec;
+  }
+
+  /** mix: array of { vol, pan, rev, dly } per track (from state.mixer). */
+  setMixer(mix) {
+    this.mix = Array.isArray(mix) ? mix.map((m) => ({ ...m })) : [];
+    this.strips.forEach((st, i) => { if (st) this.applyMix(i); });
+  }
+
+  setTrackMix(track, m) {
+    this.mix[track] = { ...m };
+    if (this.strips[track]) this.applyMix(track);
+  }
+
+  applyMix(track) {
+    const st = this.strips[track];
+    if (!st) return;
+    const m = this.mix[track] || { vol: 1, pan: 0, rev: 0, dly: 0 };
+    const t = this.ctx.currentTime;
+    const set = (param, v) => {
+      if (this.offline) param.value = v;
+      else param.setTargetAtTime(v, t, 0.015);
+    };
+    // 0.85 = the category bus gain these voices used before; vol is squared for a natural fader feel.
+    set(st.in.gain, 0.85 * m.vol * m.vol);
+    set(st.pan.pan, m.pan);
+    for (const kind of ["rev", "dly"]) {
+      const amt = m[kind] || 0;
+      if (amt > 0.001 && !st[kind]) {
+        const sends = this.ensureSends();
+        const g = this.ctx.createGain();
+        g.gain.value = 0;
+        st.pan.connect(g);
+        g.connect(sends[kind]);
+        st[kind] = g;
+      }
+      if (st[kind]) set(st[kind].gain, amt * amt);
+    }
   }
 
   readFrame(wantFreq = true) {
@@ -600,7 +728,8 @@ export class Studio {
 
   spawn(midi, time, velocity, waveOverride) {
     const ctx = this.ctx;
-    const filter = this.pitFilter;
+    const filter = this.route ? this.stripPit(this.route) : this.pitFilter;
+    const glide = this.glide;
     const musical = toMusical(this.patch);
     const wave = waveOverride || musical.wave;
     const freq = foldSub(Math.max(20, midiToHz(midi)));
@@ -632,11 +761,20 @@ export class Studio {
       return osc;
     };
 
+    // 808 slide: start at the previous note's pitch and glide (no new punch).
+    const slideTo = (osc, mult) => {
+      osc.frequency.setValueAtTime(Math.max(20, glide.fromHz * mult), time);
+      osc.frequency.exponentialRampToValueAtTime(Math.max(20, freq * mult), time + glide.sec);
+    };
     if (wave === "808") {
-      const bass = midi < 48;
+      const bass = midi < 48 && !glide;
       const osc = startOsc("sine", bass ? freq * 2.4 : freq);
       if (bass) osc.frequency.exponentialRampToValueAtTime(freq, time + 0.05);
       const harm = startOsc("sine", freq * 2);
+      if (glide) {
+        slideTo(osc, 1);
+        slideTo(harm, 2);
+      }
       const harmGain = ctx.createGain();
       harmGain.gain.setValueAtTime(bass ? 0.1 : 0.04, time);
       const shaper = ctx.createWaveShaper();
@@ -689,7 +827,9 @@ export class Studio {
       trem.connect(vca);
       extras.push(mix, highGain, shaper, trem, lfoDepth);
     } else {
-      startOsc(wave, freq).connect(env);
+      const osc = startOsc(wave, freq);
+      if (glide) slideTo(osc, 1);
+      osc.connect(env);
     }
 
     if (wave !== "horror") env.connect(vca);
@@ -809,7 +949,7 @@ export class Studio {
     if (!this.arm()) return;
     const C = this.ctx;
     const m = when;
-    const y = this.buses["808"] || this.master;
+    const y = this.busFor("808");
     const p = this.n808;
     const g = C.createOscillator();
     g.type = "sine";
@@ -839,9 +979,10 @@ export class Studio {
     if (voice === "Short Punchy") Ie *= 1.1;
     if (voice === "House Sub") Ie *= 0.9;
     Ie = foldSub(Ie); // e.g. Sub-Heavy on C1 (24.5 Hz) plays an octave up instead of below 30 Hz
-    const bt = foldSub(this.lastHz);
-    const qu = p.glide / 1000;
-    if (p.glide > 5) {
+    const slide = this.glide;
+    const bt = foldSub(slide ? slide.fromHz : this.lastHz);
+    const qu = slide ? slide.sec : p.glide / 1000;
+    if (slide || p.glide > 5) {
       g.frequency.setValueAtTime(bt, m);
       g.frequency.linearRampToValueAtTime(Ie, m + qu);
       P.frequency.setValueAtTime(bt * 1.01, m);
@@ -851,12 +992,13 @@ export class Studio {
       P.frequency.setValueAtTime(Ie * 1.01, m);
     }
     this.lastHz = Ie;
-    if (voice !== "Long Sustained" && voice !== "Dark Verb") {
+    if (!slide && voice !== "Long Sustained" && voice !== "Dark Verb") {
       g.frequency.setValueAtTime(Ie * (voice === "Short Punchy" ? 2.2 : 1.6), m);
       g.frequency.exponentialRampToValueAtTime(Ie, m + 0.09);
     }
     let hold = voice === "Long Sustained" ? 0.9 : voice === "Short Punchy" ? 0.08 : 0.35;
     if (voice === "Sliding") hold = 0.6;
+    if (this.gateSec > 0) hold = Math.max(0.03, this.gateSec - p.attack - p.decay);
     const ue = p.attack, ie = p.decay, $e = p.sustain, pt = p.release;
     // Per-voice cap: the clean sine plus the driven layer used to sum to ~1.3x
     // full scale per hit; 0.7 keeps a single NOCTURNE 808 under ~-1 dBFS.
@@ -899,7 +1041,7 @@ export class Studio {
     if (!this.arm()) return;
     const C = this.ctx;
     const m = when;
-    const y = this.buses.Drums || this.master;
+    const y = this.busFor("Drums");
     const h = velocity;
     if (name.includes("Kick") || name === "Short Punch" || name === "Analog Kick") {
       const g = C.createOscillator();
@@ -1013,7 +1155,7 @@ export class Studio {
     if (!this.arm()) return;
     const c = this.ctx;
     const h = when;
-    const dest = this.buses.Memphis || this.master;
+    const dest = this.busFor("Memphis");
     if (name === "Cassette Hiss" || name === "VHS Noise") {
       const m = c.createBufferSource();
       m.buffer = this.white;
@@ -1052,7 +1194,7 @@ export class Studio {
     if (!this.arm()) return;
     const c = this.ctx;
     const h = when;
-    const dest = this.buses.Coldwave || this.master;
+    const dest = this.busFor("Coldwave");
     const m = c.createOscillator();
     m.type = "sawtooth";
     m.frequency.value = name === "Juno Bass" ? 55 : name === "Cold Pluck" ? 220 : 110;
@@ -1087,7 +1229,7 @@ export class Studio {
     if (!this.arm()) return;
     const c = this.ctx;
     const h = when;
-    const dest = this.buses.House || this.master;
+    const dest = this.busFor("House");
     if (name.includes("Kick")) {
       const m = c.createOscillator();
       m.frequency.setValueAtTime(60, h);
@@ -1168,7 +1310,7 @@ export class Studio {
     if (!this.arm()) return;
     const c = this.ctx;
     const h = when;
-    const dest = this.buses.DSBM || this.master;
+    const dest = this.busFor("DSBM");
     if (name.includes("Tremolo")) {
       for (let i = 0; i < 16; i++) {
         const y = c.createOscillator();
@@ -1242,7 +1384,7 @@ export class Studio {
     if (!this.arm()) return;
     const c = this.ctx;
     const h = when;
-    const dest = this.buses.Vocals || this.master;
+    const dest = this.busFor("Vocals");
     if (name.includes("Telephone") || name.includes("Radio") || name.includes("Breath") || name.includes("Whisper")) {
       const m = c.createBufferSource();
       m.buffer = name.includes("Whisper") ? this.pink : this.white;
@@ -1320,7 +1462,7 @@ export class Studio {
     }
     if (forceOff) return false;
     const k = this.ctx;
-    const dest = this.buses.Ambience || this.master;
+    const dest = this.busFor("Ambience");
     const C = k.createBufferSource();
     if (name === "Electrical Hum") {
       const P = k.createBuffer(1, k.sampleRate * 2, k.sampleRate);
@@ -1351,15 +1493,38 @@ export class Studio {
     return true;
   }
 
-  triggerSource(source, step, when, velocity) {
+  /**
+   * Play one sequenced step. opts: { track, gate (sec, 0 = sound's own length), slide }.
+   * With `track`, the voice goes through that track's mixer strip.
+   */
+  triggerSource(source, step, when, velocity, opts = {}) {
     if (!this.arm()) return;
+    const track = Number.isInteger(opts.track) ? opts.track : -1;
+    const route = track >= 0 ? this.strip(track) : null;
+    this.route = route;
+    const prevHz = this.trackHz.get(track);
+    const melodic = sourceIsPit(source) || sourceIsN808(source);
+    this.glide = opts.slide && melodic && prevHz ? { fromHz: prevHz, sec: Math.max(0.03, opts.slideSec || 0.08) } : null;
+    this.gateSec = opts.gate > 0 ? opts.gate : 0;
+    try {
+      this.playSource(source, step, when, velocity);
+    } finally {
+      this.route = null;
+      this.glide = null;
+      this.gateSec = 0;
+    }
+    if (melodic && track >= 0) this.trackHz.set(track, this.lastHz);
+  }
+
+  playSource(source, step, when, velocity) {
     const t = when;
     const vel = velocity;
+    const gate = this.gateSec;
     if (sourceIsPit(source)) {
       const wave = pitWaveFromSource(source);
       const midi = step?.note ?? 36;
       const musical = toMusical(this.patch);
-      const dur = Math.max(0.16, musical.attack + musical.decay + musical.release * 0.65 + 0.18);
+      const dur = gate > 0 ? gate : Math.max(0.16, musical.attack + musical.decay + musical.release * 0.65 + 0.18);
       // Sequenced 808 subs are monophonic per source, like a real 808.
       this.firePit(midi, t, vel, wave, dur, wave === "808" ? `seq:${source}` : null);
       return;
@@ -1375,7 +1540,7 @@ export class Studio {
       const hit = hitById(id);
       if (!hit) return;
       const wave = hit.tone.wave;
-      const hold = 0.28;
+      const hold = gate > 0 ? gate : 0.28;
       for (const n of hit.notes ?? []) this.firePit(n, t, vel, wave, hold);
       return;
     }

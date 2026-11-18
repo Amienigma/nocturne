@@ -83,7 +83,7 @@ test("sanitizer rejects or repairs bad input", async () => {
   assert.equal(evil.patch.volume, DEFAULT_PATCH.volume);
   assert.equal(evil.pattern[0].source, "Hard Kick");
   assert.equal(evil.pattern[0].mute, false);
-  assert.deepEqual(evil.pattern[0].steps[0], { on: false, vel: 0.05, note: 108, chordId: "cm" });
+  assert.deepEqual(evil.pattern[0].steps[0], { on: false, vel: 0.05, note: 108, chordId: "cm", rat: 1, prob: 1, slide: false, gate: 0 });
   assert.equal(sanitizeState({ v: STATE_VERSION, pattern: [1, 2, 3] }).pattern.length, 12);
   assert.equal({}.polluted, undefined);
   // Share decoder: garbage, truncation, trailing bytes, bad indexes, oversize.
@@ -94,7 +94,8 @@ test("sanitizer rejects or repairs bad input", async () => {
   assert.throws(() => unpackState(bytes.slice(0, bytes.length - 1)));
   assert.throws(() => unpackState(Uint8Array.from([...bytes, 0])));
   const badSource = Uint8Array.from(bytes);
-  badSource[20] = 255; // first track's source index high byte
+  // v2: 6 header + 14 patch + bank + chain len + 1 chain + 48 mixer + bank mask = 72
+  badSource[72] = 255; // first track's source index high byte
   assert.throws(() => unpackState(badSource));
 });
 

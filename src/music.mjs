@@ -307,6 +307,24 @@ export function pitWaveFromSource(source) {
   return WAVE_SET.has(wave) ? wave : "808";
 }
 
+// Per-step trap features (v2). Defaults reproduce v1 behaviour exactly.
+export const RATCHETS = [1, 2, 3, 4, 6]; // hits per step: 1, 1/2, 1/3, 1/4, 1/6 rolls
+export const PROBS = [1, 0.75, 0.5, 0.25]; // chance the step plays
+export const GATES = [0, 0.5, 1, 2, 4, 8]; // note length in steps; 0 = sound's own length
+export const STEP_DEFAULTS = Object.freeze({ rat: 1, prob: 1, slide: false, gate: 0 });
+
+export function emptyCell(name) {
+  return { on: false, vel: 0.85, note: DEFAULT_NOTES[name], chordId: name === "Synth" ? "mystic" : "cm", ...STEP_DEFAULTS };
+}
+
+/** Set ratchet / probability / slide / gate (and optionally on/vel/note) for one step. */
+export function setStepProps(pattern, track, step, props) {
+  return pattern.map((row, i) => {
+    if (i !== track) return row;
+    return { ...row, steps: row.steps.map((cell, j) => (j === step ? { ...cell, ...props } : cell)) };
+  });
+}
+
 export function emptyPattern(length = 32) {
   return TRACKS.map((name) => ({
     source: DEFAULT_SOURCES[name],
@@ -314,7 +332,7 @@ export function emptyPattern(length = 32) {
     defaultChord: name === "Synth" ? "mystic" : "cm",
     mute: false,
     solo: false,
-    steps: Array.from({ length }, () => ({ on: false, vel: 0.85, note: DEFAULT_NOTES[name], chordId: name === "Synth" ? "mystic" : "cm" })),
+    steps: Array.from({ length }, () => emptyCell(name)),
   }));
 }
 
