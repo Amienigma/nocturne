@@ -44,7 +44,7 @@ export function scheduleSteps(state, bars, startAt = 0, rng = seededRng(1)) {
  * Render `bars` bars to WAV.
  * @returns {Promise<{blob: Blob, seconds: number, peak: number, channels: Float32Array[]}>}
  */
-export async function renderWav(state, { bars = 4, bitDepth = 16, masterGain = 0.85, onProgress = () => {} } = {}) {
+export async function renderWav(state, { bars = 4, bitDepth = 16, masterGain = 0.85, samples = null, onProgress = () => {} } = {}) {
   const Ctor = globalThis.OfflineAudioContext || globalThis.webkitOfflineAudioContext;
   if (!Ctor) throw new Error("This browser can't render audio offline");
   const music = (60 / state.bpm / 4) * exportSteps(state, bars);
@@ -60,6 +60,7 @@ export async function renderWav(state, { bars = 4, bitDepth = 16, masterGain = 0
   s.build();
   s.applyPatch();
   s.setMixer(state.mixer);
+  if (samples) for (const [slot, rec] of samples) s.setSample(slot, rec);
   s.setSendTempo(state.bpm);
   // Metronome stays silent: metroBus gain is 0 and no clicks are scheduled.
   const start = 0.02;

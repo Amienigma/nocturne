@@ -20,7 +20,7 @@ async function render(mutate, opts = {}) {
   const M = await import("../src/music.mjs");
   const s = defaultState();
   mutate(s, M);
-  const r = await renderWav(serializeState(s), { bars: opts.bars ?? 1, masterGain: opts.vol ?? 0.85 });
+  const r = await renderWav(serializeState(s), { bars: opts.bars ?? 1, masterGain: opts.vol ?? 0.85, samples: opts.samples });
   let ss = 0;
   let n = 0;
   for (const c of r.channels) for (let i = 0; i < c.length; i++) { ss += c[i] * c[i]; n++; }
@@ -49,6 +49,29 @@ const SCENARIOS = [
     s.mixer = s.mixer.map(() => ({ vol: 1, pan: 0, rev: 1, dly: 1 }));
   }, { vol: 1 }],
 ];
+
+// User samples at their worst: full-scale square waves and noise (normalised to
+// -6 dBFS like real imports) on every track, ×4 rolls, sends maxed.
+async function worstSamples() {
+  const { prepareSample } = await import("../src/samples.mjs");
+  const rate = 48000;
+  const samples = new Map();
+  for (let slot = 1; slot <= 8; slot++) {
+    const n = rate * 2;
+    const x = Float32Array.from({ length: n }, (_, i) => (slot % 2 ? Math.sign(Math.sin((2 * Math.PI * (40 + slot * 30) * i) / rate)) : Math.random() * 2 - 1));
+    const p = prepareSample([x], rate);
+    samples.set(slot, { name: `s${slot}`, rate: p.rate, pcm: p.pcm });
+  }
+  return samples;
+}
+if (WA) {
+  SCENARIOS.push(["user samples on every track (square/noise, ×4 rolls, sends max), vol 1, limiter off", (s) => {
+    s.limiter = false;
+    allOn(s, { rat: 4 });
+    s.pattern = s.pattern.map((row, t) => ({ ...row, source: `smp:${(t % 8) + 1}` }));
+    s.mixer = s.mixer.map(() => ({ vol: 1, pan: 0, rev: 1, dly: 1 }));
+  }, { vol: 1, samples: await worstSamples() }]);
+}
 
 for (const [name, mutate, opts] of SCENARIOS) {
   test(`loudness: ${name} stays below ${CEILING_DBFS} dBFS`, { skip: !WA && "node-web-audio-api not installed (npm install)" }, async () => {

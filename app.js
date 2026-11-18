@@ -54,10 +54,13 @@ import {
   withPatternAlias,
   snapshotOf,
   stateFromSnapshot,
+  pickRecordType,
   toStored,
   fromStored,
 } from "./src/state-io.mjs";
 import { stepHits, bankForLoop } from "./src/sequencer.mjs";
+import { SAMPLE_SLOTS, MAX_FILE_BYTES, MAX_SAMPLE_SEC, prepareSample, loadSamples, saveSample, deleteSample } from "./src/samples.mjs";
+import { midiSupported, connectMidi, drumTrackForNote } from "./src/midi.mjs";
 import { renderWav, EXPORT_BARS } from "./src/export.mjs";
 import { AI_ENDPOINT, buildBeatPrompt, extractJson, beatFromAi, RateLimiter } from "./src/beat-ai.mjs";
 
@@ -429,6 +432,7 @@ async function exportWav() {
     const snap = serializeState(state);
     const res = await renderWav(snap, {
       bars,
+      samples: sampleRecs,
       bitDepth,
       masterGain: Number($("vol").value),
       onProgress: (p) => { prog.value = p; status.textContent = `Rendering… ${Math.round(p * 100)}%`; },
@@ -883,6 +887,7 @@ const focusQuery = window.matchMedia("(max-width: 600px)");
 const isFocusView = () => focusQuery.matches;
 
 function sourceLabel(id) {
+  if (/^smp:\d$/.test(id)) return sampleLabel(Number(id.slice(4)));
   for (const group of SOURCE_GROUPS) {
     const item = group.items.find((x) => x.id === id);
     if (item) return item.label;
@@ -1581,6 +1586,237 @@ function renderMixer() {
   for (let t = 0; t < mixInputs.length; t++) renderMixerRow(t);
 }
 
+// ---- Samples (mic / file -> IndexedDB -> pads and track sources) ----
+const sampleRecs = new Map(); // slot -> { name, rate, pcm }
+let micRec = null; // { slot, recorder, stream, timer }
+
+function sampleLabel(slot) {
+  const rec = sampleRecs.get(slot);
+  return rec ? `${slot}. ${rec.name}` : `Sample ${slot} (empty)`;
+}
+
+function renderSamples() {
+  const grid = $("smp-grid");
+  const canRec = !!(navigator.mediaDevices?.getUserMedia && window.MediaRecorder);
+  if (!grid.childElementCount) {
+    for (let slot = 1; slot <= SAMPLE_SLOTS; slot++) {
+      const box = document.createElement("div");
+      box.className = "smp";
+      box.dataset.slot = String(slot);
+      box.innerHTML = `<button class="pad" type="button" data-sact="play"><b>${slot}</b><small></small></button>
+        <div class="acts"><button class="mini rec" type="button" data-sact="rec">REC</button><button class="mini" type="button" data-sact="load">LOAD</button><button class="mini" type="button" data-sact="del">CLEAR</button></div>`;
+      grid.appendChild(box);
+    }
+  }
+  for (const box of grid.children) {
+    const slot = Number(box.dataset.slot);
+    const rec = sampleRecs.get(slot);
+    const recording = micRec?.slot === slot;
+    box.querySelector("small").textContent = recording ? "recording…" : rec ? `${rec.name} · ${(rec.pcm.length / rec.rate).toFixed(1)} s` : "empty";
+    const play = box.querySelector('[data-sact="play"]');
+    play.disabled = !rec;
+    play.setAttribute("aria-label", `Play ${sampleLabel(slot)}`);
+    const recBtn = box.querySelector('[data-sact="rec"]');
+    recBtn.hidden = !canRec;
+    recBtn.textContent = recording ? "STOP" : "REC";
+    recBtn.classList.toggle("on", recording);
+    recBtn.setAttribute("aria-label", recording ? `Stop recording sample ${slot}` : `Record sample ${slot} from the microphone`);
+    recBtn.disabled = !!micRec && !recording;
+    box.querySelector('[data-sact="load"]').setAttribute("aria-label", `Load an audio file into sample ${slot}`);
+    const del = box.querySelector('[data-sact="del"]');
+    del.disabled = !rec;
+    del.setAttribute("aria-label", `Clear sample ${slot}`);
+  }
+  // Show sample names in the track sound picker.
+  for (const opt of $("trk-src").querySelectorAll('option[value^="smp:"]')) {
+    opt.textContent = sampleLabel(Number(opt.value.slice(4)));
+  }
+  updateRows();
+}
+
+function updateRows() {
+  for (let t = 0; t < seqMeta.length; t++) {
+    if (seqMeta[t]) seqMeta[t].name.textContent = `${TRACKS[t]} · ${sourceLabel(state.pattern[t].source)}`;
+  }
+}
+
+async function storeSample(slot, channels, rate, name) {
+  const prep = prepareSample(channels, rate);
+  if (!prep) {
+    $("smp-status").textContent = "That was silent, nothing saved.";
+    return;
+  }
+  const rec = { name: name.slice(0, 32) || `Sample ${slot}`, rate: prep.rate, pcm: prep.pcm };
+  sampleRecs.set(slot, rec);
+  studio.setSample(slot, rec);
+  renderSamples();
+  let saved = true;
+  try {
+    await saveSample(slot, rec);
+  } catch {
+    saved = false;
+  }
+  $("smp-status").textContent = `Sample ${slot}: ${rec.name}, ${prep.seconds.toFixed(1)} s${prep.truncated ? ` (cut to ${MAX_SAMPLE_SEC} s)` : ""}.`
+    + (saved ? "" : " This browser won't store it, so it's gone after a reload.");
+  if (arm()) studio.playSample(slot, studio.ctx.currentTime + 0.02, 0.9);
+}
+
+async function decodeInto(slot, arrayBuffer, name) {
+  if (!arm()) return;
+  let buf;
+  try {
+    buf = await studio.ctx.decodeAudioData(arrayBuffer);
+  } catch {
+    $("smp-status").textContent = "Couldn't read that audio. Try WAV, MP3, M4A/AAC or OGG.";
+    return;
+  }
+  const channels = Array.from({ length: buf.numberOfChannels }, (_, c) => buf.getChannelData(c));
+  await storeSample(slot, channels, buf.sampleRate, name);
+}
+
+function pickFile(slot) {
+  const input = $("smp-file");
+  input.value = "";
+  input.onchange = async () => {
+    const file = input.files?.[0];
+    if (!file) return;
+    if (file.size > MAX_FILE_BYTES) {
+      $("smp-status").textContent = `That file is ${(file.size / 1048576).toFixed(1)} MB; the limit is ${MAX_FILE_BYTES / 1048576} MB.`;
+      return;
+    }
+    $("smp-status").textContent = "Loading…";
+    await decodeInto(slot, await file.arrayBuffer(), file.name.replace(/\.[^.]+$/, ""));
+  };
+  input.click();
+}
+
+function stopMic() {
+  if (!micRec) return;
+  clearTimeout(micRec.timer);
+  try { micRec.recorder.stop(); } catch { /* already stopped */ }
+}
+
+async function startMic(slot) {
+  if (micRec) return;
+  if (!arm()) return;
+  let stream;
+  try {
+    // Raw mic: no echo cancellation / noise suppression / AGC on a sample.
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+  } catch (e) {
+    $("smp-status").textContent = e?.name === "NotAllowedError" ? "Microphone access was blocked. Allow it in the browser's site settings to record." : "No microphone available.";
+    return;
+  }
+  const type = pickRecordType((t) => MediaRecorder.isTypeSupported(t));
+  let recorder;
+  try {
+    recorder = new MediaRecorder(stream, type ? { mimeType: type } : undefined);
+  } catch {
+    stream.getTracks().forEach((t) => t.stop());
+    $("smp-status").textContent = "This browser can't record audio.";
+    return;
+  }
+  const chunks = [];
+  recorder.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+  recorder.onstop = async () => {
+    // Release the mic right away (iPhone shows the orange dot until we do).
+    stream.getTracks().forEach((t) => t.stop());
+    micRec = null;
+    renderSamples();
+    const blob = new Blob(chunks, { type: recorder.mimeType || type || "audio/mp4" });
+    if (!blob.size) {
+      $("smp-status").textContent = "Nothing was recorded.";
+      return;
+    }
+    await decodeInto(slot, await blob.arrayBuffer(), `Mic ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`);
+  };
+  micRec = { slot, recorder, stream, timer: window.setTimeout(stopMic, MAX_SAMPLE_SEC * 1000) };
+  recorder.start();
+  $("smp-status").textContent = `Recording sample ${slot}… tap STOP (stops by itself at ${MAX_SAMPLE_SEC} s).`;
+  renderSamples();
+}
+
+async function clearSample(slot) {
+  const rec = sampleRecs.get(slot);
+  if (!rec) return;
+  sampleRecs.delete(slot);
+  studio.setSample(slot, null);
+  try { await deleteSample(slot); } catch { /* not stored */ }
+  renderSamples();
+  showSnack(`Cleared sample ${slot}`, false, async () => {
+    sampleRecs.set(slot, rec);
+    studio.setSample(slot, rec);
+    try { await saveSample(slot, rec); } catch { /* keep in memory */ }
+    renderSamples();
+  });
+}
+
+async function initSamples() {
+  $("smp-grid").addEventListener("click", (e) => {
+    const btn = e.target.closest?.("[data-sact]");
+    if (!btn) return;
+    const slot = Number(btn.closest(".smp").dataset.slot);
+    const act = btn.dataset.sact;
+    if (act === "play" && arm()) studio.playSample(slot, studio.ctx.currentTime, 0.9);
+    else if (act === "rec") (micRec ? stopMic() : void startMic(slot));
+    else if (act === "load") pickFile(slot);
+    else if (act === "del") void clearSample(slot);
+  });
+  renderSamples();
+  const stored = await loadSamples();
+  for (const [slot, rec] of stored) {
+    sampleRecs.set(slot, rec);
+    studio.setSample(slot, rec);
+  }
+  renderSamples();
+}
+
+// ---- MIDI input (Web MIDI; not available on iPhone/iPad Safari) ----
+let midiOn = false;
+
+function midiNote(msg) {
+  if (!arm()) return;
+  if (msg.ch === 9) {
+    // GM drums on channel 10 play the matching sequencer track's sound.
+    if (msg.type !== "on") return;
+    const track = drumTrackForNote(msg.note);
+    const row = state.pattern[track];
+    studio.triggerSource(row.source, row.steps[0], studio.ctx.currentTime, msg.vel, { track });
+    return;
+  }
+  if (msg.type === "on") studio.down(msg.note, `midi:${msg.note}`, Math.max(0.2, msg.vel));
+  else studio.up(msg.note, `midi:${msg.note}`);
+}
+
+function initMidi() {
+  const btn = $("midi");
+  const status = $("midi-status");
+  if (!midiSupported()) {
+    btn.disabled = true;
+    btn.title = "Web MIDI isn't available in this browser";
+    status.textContent = "MIDI input works in Chrome, Edge and Firefox on desktop and Android. iPhone and iPad Safari don't support Web MIDI.";
+    return;
+  }
+  status.textContent = "Connect a MIDI keyboard or pad controller, then press MIDI. Channel 10 plays the drum tracks (GM map); other channels play the synth.";
+  const show = (names) => {
+    status.textContent = names.length ? `MIDI: ${names.join(", ")}` : "MIDI is on. No devices connected yet.";
+  };
+  btn.addEventListener("click", async () => {
+    if (midiOn) return;
+    btn.disabled = true;
+    const res = await connectMidi(midiNote, show);
+    btn.disabled = false;
+    if (!res.ok) {
+      status.textContent = res.reason === "denied" ? "MIDI access was blocked for this site." : "Couldn't start MIDI.";
+      return;
+    }
+    midiOn = true;
+    btn.classList.add("on");
+    btn.setAttribute("aria-pressed", "true");
+    show(res.inputs);
+  });
+}
+
 // ---- Recording with optional one-bar count-in ----
 let countIn = null;
 
@@ -1977,6 +2213,8 @@ initSeqEvents();
 initBanks();
 initInspector();
 initMixer();
+void initSamples();
+initMidi();
 renderPaint();
 renderSeq();
 bind();

@@ -29,6 +29,14 @@ NOCTURNE brings the synth keyboard, trap drum pad, genre banks and 12-track step
 ### Mixer
 Each of the 12 tracks has volume, pan, reverb send and delay send (the MIXER panel, collapsed by default). There is one shared reverb and one tempo-synced dotted-⅛ delay, built only when a send is first turned up. At default settings the mix sounds exactly as before. The mixer applies to the sequencer and to exports. Pads and keys you play live skip it. Double-click a fader to reset it.
 
+### Samples and MIDI
+- **SAMPLES:** 8 pads. **REC** records from the microphone (stops by itself at 10 s). **LOAD** imports an audio file (WAV, MP3, M4A/AAC, OGG…, up to 10 MB).
+  - Each sample is trimmed of silence, mixed to mono, cut to 10 s, normalised to −6 dBFS and faded so it never clicks. It is kept in this browser (IndexedDB, 16-bit, about 1 MB per 10 s).
+  - Tap a pad to play it. Pick it as a track sound ("Your samples") to sequence it. Rolls, chance, length, the mixer and EXPORT WAV all work with it. A new hit chokes the previous one on the same pad.
+  - Share links point to sample slots but don't carry the audio; the receiver hears their own samples or nothing. CLEAR has an undo toast.
+  - **iPhone:** recording works in Safari (iOS 14.5+) after you allow the microphone. The mic is released as soon as you stop. If a browser can't record, REC is hidden and LOAD still works.
+- **MIDI input:** press **MIDI** to connect keyboards and pad controllers (Web MIDI). Channel 10 plays the drum tracks using the General MIDI map (36 kick, 38 snare, 39 clap, 42 closed hat, 46 open hat, everything else Perc). Other channels play the synth with velocity. Devices can be plugged in later. iPhone and iPad Safari don't support Web MIDI, so the button is disabled there with an explanation.
+
 ### Keyboard and screen readers
 Steps are toggle buttons with `aria-pressed` and labels such as "Kick step 5, velocity 80%, roll ×3, 50% chance". The grid uses a single tab stop: arrow keys move, Home/End jump, Enter or Space toggles, and Shift+Enter cycles velocity. Mouse and touch taps don't take keyboard focus, so Space still means PLAY.
 

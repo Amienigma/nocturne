@@ -198,6 +198,14 @@
     .insp input[type=range] { width: 90px; }
     .insp.off label, .insp.off #insp-slide { opacity: .45; }
     .mini.queued { border-color: var(--orange); }
+    .smp-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    @media (min-width: 700px) { .smp-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+    .smp { border: 1px solid var(--border); background: var(--card); border-radius: 10px; padding: 8px; display: grid; gap: 6px; min-width: 0; }
+    .smp .pad { min-height: 52px; width: 100%; min-width: 0; overflow: hidden; }
+    .smp .pad small { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .smp .acts { display: flex; gap: 4px; flex-wrap: wrap; }
+    .smp .acts .mini { padding: 4px 7px; }
+    .smp .mini.rec.on { background: #e5484d; border-color: #e5484d; color: #fff; }
     .chain { display: inline-flex; flex-wrap: wrap; gap: 3px; }
     .chain .mini { padding: 4px 7px; }
     .chain .mini.now { background: var(--cyan); color: #111; }
@@ -303,6 +311,19 @@
       <div class="drum-grid" id="hats"></div>
       <div class="subhead">PERC</div>
       <div class="drum-grid" id="perc"></div>
+    </section>
+
+    <section class="panel" id="sampler">
+      <div class="row">
+        <h2 class="grotesk">SAMPLES <span>RECORD OR IMPORT · 8 PADS · UP TO 10 s EACH</span></h2>
+        <div class="controls">
+          <button class="btn" id="midi" type="button" aria-pressed="false">MIDI</button>
+        </div>
+      </div>
+      <div class="smp-grid" id="smp-grid"></div>
+      <input id="smp-file" type="file" accept="audio/*,.wav,.mp3,.m4a,.aac,.ogg,.flac,.aif,.aiff,.caf" hidden>
+      <p class="hint" id="smp-status" role="status" aria-live="polite">Tap REC to record from the mic (stops at 10 s) or LOAD to import an audio file (up to 10 MB). Samples are trimmed, normalised and kept in this browser. Use them as a track sound ("Your samples") in the sequencer. Share links point to your sample slots but don't include the audio.</p>
+      <p class="hint" id="midi-status" role="status" aria-live="polite"></p>
     </section>
 
     <section class="panel">
