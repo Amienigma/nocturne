@@ -3,7 +3,7 @@
 // picked up on the next load and files never mix versions), falling back to
 // the cache only when offline or the network stalls. Bump VERSION when the
 // shell file list changes; old caches are deleted on activate.
-const VERSION = "v1";
+const VERSION = "v2";
 const CACHE = `nocturne-shell-${VERSION}`;
 const SHELL = [
   "./", // not "./index.html": hosts with clean URLs (Vercel) redirect it
@@ -15,6 +15,7 @@ const SHELL = [
   "./src/wav.mjs",
   "./src/export.mjs",
   "./src/beat-ai.mjs",
+  "./src/sequencer.mjs",
   "./fonts/fonts.css",
   "./fonts/jetbrains-mono-latin.woff2",
   "./fonts/space-grotesk-latin.woff2",

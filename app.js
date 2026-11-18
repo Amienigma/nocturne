@@ -34,10 +34,11 @@ import {
   REL_MIN,
   REL_MAX,
   cycleStepVelocity,
+  setStepProps,
+  emptyPattern,
 } from "./src/music.mjs";
 import {
   serializeState,
-  sanitizeState,
   defaultMetronome,
   encodeShare,
   decodeShare,
@@ -46,21 +47,37 @@ import {
   TapTempo,
   BPM_MIN,
   BPM_MAX,
+  BANKS as PATTERN_BANKS,
+  BANK_NAMES,
+  CHAIN_MAX,
+  defaultMix,
+  withPatternAlias,
+  snapshotOf,
+  stateFromSnapshot,
+  toStored,
+  fromStored,
 } from "./src/state-io.mjs";
+import { stepHits, bankForLoop } from "./src/sequencer.mjs";
 import { renderWav, EXPORT_BARS } from "./src/export.mjs";
 import { AI_ENDPOINT, buildBeatPrompt, extractJson, beatFromAi, RateLimiter } from "./src/beat-ai.mjs";
 
 const studio = getStudio();
-const state = {
+const state = withPatternAlias({
   patch: { ...DEFAULT_PATCH },
   octave: 3,
-  bank: "atlanta",
+  hitBank: "atlanta",
   armed: false,
   playing: false,
   bpm: 100,
   swing: 0,
   length: 16,
-  pattern: applyPreset("ATLANTA NIGHT"),
+  // Pattern banks A–D; `state.pattern` is an alias for banks[bank].
+  banks: [applyPreset("ATLANTA NIGHT"), emptyPattern(32), emptyPattern(32), emptyPattern(32)],
+  bank: 0,
+  chain: [0],
+  song: false,
+  mixer: TRACKS.map(defaultMix),
+  focusStep: { t: 6, s: 0 },
   preset: "ATLANTA NIGHT",
   selectedTrack: 6,
   paintNote: 36,
@@ -76,9 +93,10 @@ const state = {
   soundBank: "Memphis",
   active: [],
   metronome: defaultMetronome(),
-};
+});
 
 const $ = (id) => document.getElementById(id);
+window.__nocturneState = state; // for tests/debugging
 
 // ---- Save, autosave, undo/redo -------------------------------------------
 const AUTOSAVE_KEY = "nocturne.autosave.v1";
@@ -88,7 +106,9 @@ const history = new UndoStack(100);
 let pendingEdit = null;
 let autosaveTimer = 0;
 
-const snapshot = () => JSON.stringify(serializeState(state));
+// Undo snapshots are the compact binary state (a few hundred bytes for four
+// banks) instead of JSON (tens of KB each), so 100 undo steps stay small.
+const snapshot = () => snapshotOf(state);
 // Undo covers the beat (pattern, tempo, swing, length, limiter). The synth
 // patch (also changed by pads) and metronome prefs are autosaved but are left
 // alone by undo/redo so undoing a step never silently changes your sound.
@@ -104,17 +124,28 @@ function store() {
 
 /** Apply a sanitized saved state to the app. `keepMetronome` leaves the user's metronome prefs alone. */
 function applyState(raw, { keepMetronome = false, keepPatch = false } = {}) {
-  const s = sanitizeState(typeof raw === "string" ? safeParse(raw) : raw);
+  let s = null;
+  if (typeof raw === "string") s = raw.startsWith("{") ? fromStored(safeParse(raw)) : safeSnapshot(raw);
+  else s = fromStored(raw);
   if (!s) return false;
   state.bpm = s.bpm;
   state.swing = s.swing;
   state.length = s.length;
   state.limiter = s.limiter;
   if (!keepPatch) state.patch = s.patch;
-  state.pattern = s.pattern;
+  state.banks = s.banks;
+  state.bank = s.bank;
+  state.chain = s.chain;
+  state.song = s.song;
+  state.mixer = s.mixer;
+  queuedBank = null;
   if (!keepMetronome) state.metronome = s.metronome;
   studio.setPatch(state.patch);
   studio.setLimiter(state.limiter);
+  studio.setMixer(state.mixer);
+  studio.setSendTempo(state.bpm);
+  renderBanks();
+  renderMixer();
   syncControls();
   renderWaves();
   renderKnobs();
@@ -122,6 +153,14 @@ function applyState(raw, { keepMetronome = false, keepPatch = false } = {}) {
   renderPaint();
   renderLcd();
   return true;
+}
+
+function safeSnapshot(snap) {
+  try {
+    return stateFromSnapshot(snap);
+  } catch {
+    return null;
+  }
 }
 
 function safeParse(text) {
@@ -206,7 +245,7 @@ function saveNow() {
   clearTimeout(autosaveTimer);
   autosaveTimer = 0;
   try {
-    store()?.setItem(AUTOSAVE_KEY, snapshot());
+    store()?.setItem(AUTOSAVE_KEY, JSON.stringify(toStored(state)));
   } catch { /* storage full or blocked: keep playing */ }
 }
 
@@ -219,7 +258,7 @@ function readSlots() {
   const list = safeParse(store()?.getItem(SLOTS_KEY) || "[]");
   if (!Array.isArray(list)) return [];
   return list
-    .filter((x) => x && typeof x.name === "string" && sanitizeState(x.state))
+    .filter((x) => x && typeof x.name === "string" && fromStored(x.state))
     .slice(0, MAX_SLOTS)
     .map((x) => ({ name: x.name.slice(0, 40), at: Number(x.at) || 0, state: x.state }));
 }
@@ -258,7 +297,7 @@ function renderSlots(selected) {
 function saveSlot() {
   const name = $("slot-name").value.trim().slice(0, 40) || `Beat ${new Date().toLocaleString()}`;
   const slots = readSlots().filter((x) => x.name !== name);
-  slots.unshift({ name, at: Date.now(), state: serializeState(state) });
+  slots.unshift({ name, at: Date.now(), state: toStored(state) });
   if (writeSlots(slots)) {
     renderSlots(name);
     showSnack(`Saved "${name}"`);
@@ -597,17 +636,17 @@ function renderKnobs() {
 }
 
 function renderBank() {
-  const hint = state.bank === "atlanta"
+  const hint = state.hitBank === "atlanta"
     ? "Sine subs with a pitch-drop punch. Chords keep the 808 under a soft stack."
     : "Minor stabs, the tritone, and a chromatic church descent.";
   $("bank-hint").textContent = hint;
-  $("notes-label").textContent = state.bank === "atlanta" ? "Subs" : "Notes";
+  $("notes-label").textContent = state.hitBank === "atlanta" ? "Subs" : "Notes";
   document.querySelectorAll("[data-bank]").forEach((el) => {
-    el.classList.toggle("on", el.dataset.bank === state.bank);
+    el.classList.toggle("on", el.dataset.bank === state.hitBank);
   });
-  fillHits($("pit-notes"), hitsIn(state.bank, "note"));
-  fillHits($("pit-chords"), hitsIn(state.bank, "chord"));
-  fillHits($("pit-loops"), hitsIn(state.bank, "loop"));
+  fillHits($("pit-notes"), hitsIn(state.hitBank, "note"));
+  fillHits($("pit-chords"), hitsIn(state.hitBank, "chord"));
+  fillHits($("pit-loops"), hitsIn(state.hitBank, "loop"));
 }
 
 function fillHits(root, hits) {
@@ -853,7 +892,8 @@ function sourceLabel(id) {
 
 function cellText(row, cell) {
   if (!cell.on || !sourceIsMelodic(row.source)) return "";
-  return sourceIsChord(row.source) ? (HITS.find((h) => h.id === cell.chordId)?.symbol || "•") : noteName(cell.note);
+  if (sourceIsChord(row.source)) return HITS.find((h) => h.id === cell.chordId)?.symbol || "•";
+  return `${cell.slide ? "↗" : ""}${noteName(cell.note)}`;
 }
 
 // Update one step button in place (no grid rebuild on a tap).
@@ -867,8 +907,24 @@ function updateCell(track, step) {
   if (btn.textContent !== text) btn.textContent = text;
   btn.style.setProperty("--vel", String(cell.vel));
   btn.setAttribute("aria-pressed", String(cell.on));
-  btn.setAttribute("aria-label", `${TRACKS[track]} step ${step + 1}${cell.on ? `, velocity ${Math.round(cell.vel * 100)}%` : ""}`);
-  btn.title = cell.on ? `Velocity ${Math.round(cell.vel * 100)}% · hold, right-click or shift-click to change` : "";
+  const extras = cellExtras(cell);
+  if (cell.on && cell.rat > 1) btn.dataset.rat = String(cell.rat);
+  else delete btn.dataset.rat;
+  btn.classList.toggle("prob", cell.on && cell.prob < 1);
+  btn.classList.toggle("slide", cell.on && cell.slide);
+  btn.classList.toggle("sel-step", state.focusStep.t === track && state.focusStep.s === step);
+  btn.tabIndex = state.focusStep.t === track && state.focusStep.s === step ? 0 : -1;
+  btn.setAttribute("aria-label", `${TRACKS[track]} step ${step + 1}${cell.on ? `, velocity ${Math.round(cell.vel * 100)}%${extras}` : ""}`);
+  btn.title = cell.on ? `Velocity ${Math.round(cell.vel * 100)}%${extras} · hold, right-click or shift-click to change` : "";
+}
+
+function cellExtras(cell) {
+  let out = "";
+  if (cell.rat > 1) out += `, roll ×${cell.rat}`;
+  if (cell.prob < 1) out += `, ${Math.round(cell.prob * 100)}% chance`;
+  if (cell.slide) out += ", slide";
+  if (cell.gate > 0) out += `, length ${cell.gate} step${cell.gate === 1 ? "" : "s"}`;
+  return out;
 }
 
 function updateRow(track) {
@@ -932,6 +988,7 @@ function buildSeq() {
 
 /** Bring the grid in line with state: rebuild only when the length changed. */
 function renderSeq() {
+  if (state.focusStep.s >= state.length) state.focusStep = { t: state.focusStep.t, s: 0 };
   if (seqBuiltFor !== state.length || seqCells.length !== state.pattern.length) buildSeq();
   $("seq-title").textContent = `12 TRACKS × ${state.length}`;
   document.querySelectorAll("[data-len]").forEach((el) => {
@@ -957,6 +1014,7 @@ function renderTrackBar() {
 function selectTrack(t) {
   const n = state.pattern.length;
   state.selectedTrack = ((t % n) + n) % n;
+  if (state.focusStep.t !== state.selectedTrack) setFocusStep(state.selectedTrack, state.focusStep.s, false);
   renderTrackBar();
   renderPaint();
 }
@@ -1007,12 +1065,13 @@ function toggleFlag(track, flag) {
 
 function previewStep(track, step) {
   const c = state.pattern[track].steps[step];
-  if (c.on && arm()) studio.triggerSource(state.pattern[track].source, c, studio.ctx.currentTime, c.vel);
+  if (c.on && arm()) studio.triggerSource(state.pattern[track].source, c, studio.ctx.currentTime, c.vel, { track });
 }
 
 function paintStep(track, step) {
   const cell = state.pattern[track].steps[step];
   if (state.selectedTrack !== track) selectTrack(track);
+  setFocusStep(track, step, false);
   commit(() => {
     state.pattern = toggleStep(state.pattern, track, step, {
       note: state.paintNote,
@@ -1022,13 +1081,16 @@ function paintStep(track, step) {
     });
   });
   updateCell(track, step);
+  renderInspector();
   previewStep(track, step);
 }
 
 function cycleVelAt(track, step) {
   if (state.selectedTrack !== track) selectTrack(track);
+  setFocusStep(track, step, false);
   commit(() => { state.pattern = cycleStepVelocity(state.pattern, track, step); });
   updateCell(track, step);
+  renderInspector();
   previewStep(track, step);
 }
 
@@ -1045,6 +1107,8 @@ function initSeqEvents() {
   root.addEventListener("pointerdown", (e) => {
     const btn = target(e);
     if (!btn || btn.dataset.s == null || e.button !== 0) return;
+    // Mouse/touch taps don't move keyboard focus, so Space keeps meaning PLAY.
+    if (e.pointerType === "mouse") e.preventDefault();
     cancelHold();
     const t = Number(btn.dataset.t);
     const s = Number(btn.dataset.s);
@@ -1079,6 +1143,36 @@ function initSeqEvents() {
     e.preventDefault();
     if (performance.now() < suppressStepClickUntil) return;
     cycleVelAt(Number(btn.dataset.t), Number(btn.dataset.s));
+  });
+  // Keyboard: roving tabindex across the grid. Arrows move, Home/End jump,
+  // Enter/Space toggle (native button), Shift+Enter cycles velocity.
+  root.addEventListener("keydown", (e) => {
+    const btn = target(e);
+    if (!btn || btn.dataset.s == null || e.metaKey || e.ctrlKey || e.altKey) return;
+    const t = Number(btn.dataset.t);
+    const s = Number(btn.dataset.s);
+    const n = state.pattern.length;
+    let nt = t;
+    let ns = s;
+    if (e.key === "ArrowRight") ns = (s + 1) % state.length;
+    else if (e.key === "ArrowLeft") ns = (s - 1 + state.length) % state.length;
+    else if (e.key === "ArrowDown") nt = (t + 1) % n;
+    else if (e.key === "ArrowUp") nt = (t - 1 + n) % n;
+    else if (e.key === "Home") ns = 0;
+    else if (e.key === "End") ns = state.length - 1;
+    else if (e.key === "Enter" && e.shiftKey) {
+      e.preventDefault();
+      e.stopPropagation();
+      cycleVelAt(t, s);
+      return;
+    } else {
+      if (e.key === " " || e.key === "Enter") e.stopPropagation();
+      return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    if (nt !== t) selectTrack(nt);
+    setFocusStep(nt, ns, true);
   });
   // Focus view: swipe left/right across the steps to change track.
   let touch = null;
@@ -1130,6 +1224,8 @@ let timer = 0;
 let nextTime = 0;
 let stepIndex = 0;
 let absStep = 0; // steps since PLAY, for bar-accurate metronome accents
+let loopCount = 0; // pattern loops since PLAY (song position)
+let queuedBank = null; // bank picked while playing; starts at the next loop
 const lightTimers = new Set();
 
 function outputDelay() {
@@ -1174,14 +1270,10 @@ function scheduler() {
     const step = stepIndex % state.length;
     const swing = step % 2 === 1 ? (state.swing / 100) * stepSec * 0.5 : 0;
     const when = nextTime + swing;
-    const anySolo = state.pattern.some((row) => row.solo);
-    state.pattern.forEach((row, track) => {
-      if (row.mute) return;
-      if (anySolo && !row.solo) return;
-      const cell = row.steps[step];
-      if (!cell.on) return;
-      studio.triggerSource(row.source, cell, when, cell.vel);
-    });
+    if (step === 0 && absStep > 0) loopBoundary(nextTime);
+    for (const h of stepHits(state.pattern, step, stepSec)) {
+      studio.triggerSource(h.source, h.cell, when + h.at, h.vel, h.opts);
+    }
     queueLight(step, when);
     // Metronome: quarter notes on the same AudioContext clock as the drums.
     // Beats land on even steps, which swing never moves.
@@ -1211,16 +1303,282 @@ function setPlaying(on, startAt = null) {
     if (startAt == null) nextTime = studio.ctx.currentTime + 0.05;
     stepIndex = 0;
     absStep = 0;
+    loopCount = 0;
+    if (state.song) switchBank(bankForLoop(state, 0));
+    else if (queuedBank != null) switchBank(queuedBank);
+    queuedBank = null;
+    renderBanks();
     timer = window.setInterval(scheduler, 25);
     kickScope();
   } else {
     // Just move the playhead off; no need to rebuild the whole grid.
     clearLights();
     state.currentStep = -1;
+    queuedBank = null;
+    renderBanks();
     // The AudioContext suspends itself once tails have rung out (studio idle check).
     studio.lastUse = performance.now();
   }
   renderLcd();
+}
+
+// ---- Step focus + inspector (velocity, roll, chance, length, slide) ----
+function setFocusStep(t, s, moveFocus) {
+  const prev = state.focusStep;
+  state.focusStep = { t, s };
+  if (prev.t !== t || prev.s !== s) updateCell(prev.t, prev.s);
+  updateCell(t, s);
+  if (moveFocus) seqCells[t]?.[s]?.focus();
+  renderInspector();
+}
+
+function renderInspector() {
+  const { t, s } = state.focusStep;
+  const row = state.pattern[t];
+  const cell = row?.steps[s];
+  if (!cell) return;
+  const melodic = sourceIsMelodic(row.source) && !sourceIsChord(row.source);
+  $("insp-title").textContent = `${TRACKS[t].toUpperCase()} · STEP ${s + 1}${cell.on ? "" : " (off)"}`;
+  $("insp").classList.toggle("off", !cell.on);
+  $("insp-vel").value = String(cell.vel);
+  $("insp-vel-val").textContent = `${Math.round(cell.vel * 100)}%`;
+  $("insp-rat").value = String(cell.rat);
+  $("insp-prob").value = String(cell.prob);
+  $("insp-gate").value = String(cell.gate);
+  const slide = $("insp-slide");
+  slide.classList.toggle("on", cell.slide);
+  slide.setAttribute("aria-pressed", String(cell.slide));
+  slide.disabled = !melodic;
+  slide.title = melodic ? "Glide from the previous note on this track" : "Slide works on 808 / synth tracks";
+  for (const id of ["insp-vel", "insp-rat", "insp-prob", "insp-gate"]) $(id).disabled = !cell.on;
+  if (!cell.on) slide.disabled = true;
+}
+
+function editFocused(props, { live = false } = {}) {
+  const { t, s } = state.focusStep;
+  const apply = () => { state.pattern = setStepProps(state.pattern, t, s, props); };
+  if (live) apply();
+  else commit(apply);
+  updateCell(t, s);
+  renderInspector();
+}
+
+function initInspector() {
+  const vel = $("insp-vel");
+  vel.addEventListener("input", () => {
+    beginEdit();
+    editFocused({ vel: Math.round(Number(vel.value) * 100) / 100 }, { live: true });
+  });
+  vel.addEventListener("change", endEdit);
+  $("insp-rat").addEventListener("change", (e) => editFocused({ rat: Number(e.target.value) }));
+  $("insp-prob").addEventListener("change", (e) => editFocused({ prob: Number(e.target.value) }));
+  $("insp-gate").addEventListener("change", (e) => editFocused({ gate: Number(e.target.value) }));
+  $("insp-slide").addEventListener("click", () => {
+    const { t, s } = state.focusStep;
+    editFocused({ slide: !state.pattern[t].steps[s].slide });
+  });
+}
+
+// ---- Pattern banks A–D and song chain ----
+let bankClipboard = null;
+
+function switchBank(b) {
+  if (b === state.bank || b < 0 || b >= PATTERN_BANKS) return;
+  state.bank = b;
+  renderSeq();
+  renderInspector();
+  renderBanks();
+  scheduleAutosave();
+}
+
+function pickBank(b) {
+  if (state.playing && !state.song) {
+    queuedBank = b === state.bank ? null : b;
+    renderBanks();
+    return;
+  }
+  switchBank(b);
+}
+
+// Called by the scheduler when a pattern loop wraps (at audio time `when`).
+function loopBoundary(when) {
+  loopCount += 1;
+  let next = null;
+  if (state.song) next = bankForLoop(state, loopCount);
+  else if (queuedBank != null) next = queuedBank;
+  queuedBank = null;
+  if (next == null || next === state.bank) {
+    if (state.song) queueUi(when, renderBanks);
+    return;
+  }
+  // The audio switches now (the scheduler reads state.pattern); the grid
+  // follows when the new loop is actually heard.
+  state.bank = next;
+  queueUi(when, () => {
+    renderSeq();
+    renderInspector();
+    renderBanks();
+  });
+}
+
+function queueUi(when, fn) {
+  const ms = Math.max(0, (when + outputDelay() - studio.ctx.currentTime) * 1000);
+  const id = window.setTimeout(() => {
+    lightTimers.delete(id);
+    fn();
+  }, ms);
+  lightTimers.add(id);
+}
+
+function renderBanks() {
+  document.querySelectorAll("[data-pbank]").forEach((el) => {
+    const b = Number(el.dataset.pbank);
+    el.classList.toggle("on", b === state.bank);
+    el.classList.toggle("queued", b === queuedBank);
+    el.setAttribute("aria-pressed", String(b === state.bank));
+  });
+  $("song").classList.toggle("on", state.song);
+  $("song").setAttribute("aria-pressed", String(state.song));
+  $("bank-paste").disabled = !bankClipboard;
+  const chain = $("chain");
+  chain.innerHTML = "";
+  const pos = state.playing && state.song ? loopCount % state.chain.length : -1;
+  state.chain.forEach((b, i) => {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = `mini${i === pos ? " now" : ""}`;
+    chip.textContent = BANK_NAMES[b];
+    chip.dataset.ci = String(i);
+    chip.setAttribute("aria-label", `Song part ${i + 1}: bank ${BANK_NAMES[b]}. Activate to change`);
+    chain.appendChild(chip);
+  });
+  $("chain-add").disabled = state.chain.length >= CHAIN_MAX;
+  $("chain-del").disabled = state.chain.length <= 1;
+  $("bank-status").textContent = queuedBank != null
+    ? `Bank ${BANK_NAMES[queuedBank]} starts next loop`
+    : state.song ? `Song: ${state.chain.length} part${state.chain.length === 1 ? "" : "s"}` : "";
+  const bars = $("exp-bars");
+  if (bars) {
+    bars.disabled = state.song;
+    bars.title = state.song ? "Song mode exports the whole chain once" : "";
+  }
+}
+
+function initBanks() {
+  document.querySelectorAll("[data-pbank]").forEach((el) => {
+    el.addEventListener("click", () => pickBank(Number(el.dataset.pbank)));
+  });
+  $("bank-copy").addEventListener("click", () => {
+    bankClipboard = JSON.parse(JSON.stringify(state.pattern));
+    renderBanks();
+    showSnack(`Bank ${BANK_NAMES[state.bank]} copied`);
+  });
+  $("bank-paste").addEventListener("click", () => {
+    if (!bankClipboard) return;
+    const copy = JSON.parse(JSON.stringify(bankClipboard));
+    commit(() => { state.pattern = copy; }, `Pasted into bank ${BANK_NAMES[state.bank]}`);
+    renderSeq();
+    renderInspector();
+  });
+  $("song").addEventListener("click", () => {
+    commit(() => { state.song = !state.song; });
+    if (state.song && state.playing) queuedBank = null;
+    renderBanks();
+  });
+  $("chain").addEventListener("click", (e) => {
+    const chip = e.target.closest?.("[data-ci]");
+    if (!chip) return;
+    const i = Number(chip.dataset.ci);
+    commit(() => {
+      state.chain = state.chain.map((b, j) => (j === i ? (b + 1) % PATTERN_BANKS : b));
+    });
+    renderBanks();
+  });
+  $("chain-add").addEventListener("click", () => {
+    if (state.chain.length >= CHAIN_MAX) return;
+    commit(() => { state.chain = [...state.chain, state.bank]; });
+    renderBanks();
+  });
+  $("chain-del").addEventListener("click", () => {
+    if (state.chain.length <= 1) return;
+    commit(() => { state.chain = state.chain.slice(0, -1); });
+    renderBanks();
+  });
+}
+
+// ---- Mixer ----
+const MIX_PARAMS = [
+  { key: "vol", label: "VOL", min: 0, max: 1, fmt: (v) => `${Math.round(v * 100)}` },
+  { key: "pan", label: "PAN", min: -1, max: 1, fmt: (v) => (Math.abs(v) < 0.005 ? "C" : `${v < 0 ? "L" : "R"}${Math.round(Math.abs(v) * 100)}`) },
+  { key: "rev", label: "REV", min: 0, max: 1, fmt: (v) => `${Math.round(v * 100)}` },
+  { key: "dly", label: "DLY", min: 0, max: 1, fmt: (v) => `${Math.round(v * 100)}` },
+];
+let mixInputs = [];
+
+function initMixer() {
+  const root = $("mixer");
+  root.innerHTML = "";
+  mixInputs = TRACKS.map((name, t) => {
+    const row = document.createElement("div");
+    row.className = "mix-row";
+    const b = document.createElement("b");
+    b.textContent = `${t + 1}. ${name}`;
+    row.appendChild(b);
+    const inputs = {};
+    for (const p of MIX_PARAMS) {
+      const label = document.createElement("label");
+      const cap = document.createElement("span");
+      const input = document.createElement("input");
+      input.type = "range";
+      input.min = String(p.min);
+      input.max = String(p.max);
+      input.step = "0.01";
+      input.dataset.t = String(t);
+      input.dataset.k = p.key;
+      input.setAttribute("aria-label", `${name} ${p.key === "vol" ? "volume" : p.key === "pan" ? "pan" : p.key === "rev" ? "reverb send" : "delay send"}`);
+      label.append(cap, input);
+      row.appendChild(label);
+      inputs[p.key] = { input, cap, p };
+    }
+    root.appendChild(row);
+    return inputs;
+  });
+  root.addEventListener("input", (e) => {
+    const el = e.target;
+    if (!(el instanceof HTMLInputElement) || el.dataset.k == null) return;
+    beginEdit();
+    const t = Number(el.dataset.t);
+    const v = Math.round(Number(el.value) * 100) / 100;
+    state.mixer = state.mixer.map((m, i) => (i === t ? { ...m, [el.dataset.k]: v } : m));
+    studio.setTrackMix(t, state.mixer[t]);
+    renderMixerRow(t);
+  });
+  root.addEventListener("change", endEdit);
+  // Double-click a fader to reset it.
+  root.addEventListener("dblclick", (e) => {
+    const el = e.target;
+    if (!(el instanceof HTMLInputElement) || el.dataset.k == null) return;
+    const t = Number(el.dataset.t);
+    commit(() => {
+      state.mixer = state.mixer.map((m, i) => (i === t ? { ...m, [el.dataset.k]: defaultMix()[el.dataset.k] } : m));
+    });
+    studio.setTrackMix(t, state.mixer[t]);
+    renderMixerRow(t);
+  });
+}
+
+function renderMixerRow(t) {
+  const inputs = mixInputs[t];
+  if (!inputs) return;
+  for (const { input, cap, p } of Object.values(inputs)) {
+    const v = state.mixer[t][p.key];
+    if (document.activeElement !== input) input.value = String(v);
+    cap.textContent = `${p.label} ${p.fmt(v)}`;
+  }
+}
+
+function renderMixer() {
+  for (let t = 0; t < mixInputs.length; t++) renderMixerRow(t);
 }
 
 // ---- Recording with optional one-bar count-in ----
@@ -1420,6 +1778,7 @@ function bind() {
     state.bpm = Math.min(BPM_MAX, Math.max(BPM_MIN, Math.round(Number(v) || state.bpm)));
     $("bpm").value = String(state.bpm);
     $("bpm-num").value = String(state.bpm);
+    studio.setSendTempo(state.bpm);
   };
   $("bpm").addEventListener("input", () => {
     beginEdit();
@@ -1541,12 +1900,14 @@ function bind() {
   });
   document.querySelectorAll("[data-bank]").forEach((el) => {
     el.addEventListener("click", () => {
-      state.bank = el.dataset.bank;
+      state.hitBank = el.dataset.bank;
       renderBank();
     });
   });
   window.addEventListener("keydown", (e) => {
     if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement || e.target instanceof HTMLTextAreaElement) return;
+    // Keys typed on a focused step belong to the grid (handled there), except undo/redo.
+    if (e.target instanceof Element && e.target.closest("#seq") && !(e.metaKey || e.ctrlKey)) return;
     const key = e.key.toLowerCase();
     if ((e.metaKey || e.ctrlKey) && (key === "z" || key === "y")) {
       e.preventDefault();
@@ -1613,9 +1974,16 @@ renderSoundBanks();
 renderPresets();
 initTrackBar();
 initSeqEvents();
+initBanks();
+initInspector();
+initMixer();
 renderPaint();
 renderSeq();
 bind();
+studio.setMixer(state.mixer);
+renderBanks();
+renderMixer();
+renderInspector();
 loadAutosave();
 syncControls();
 renderSlots();

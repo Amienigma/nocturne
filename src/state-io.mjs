@@ -12,9 +12,17 @@ import {
   DEFAULT_PATCH,
   emptyPattern,
   sanitizePatch,
+  RATCHETS,
+  PROBS,
+  GATES,
 } from "./music.mjs";
 
-export const STATE_VERSION = 1;
+// v2 adds pattern banks A–D, song chain, per-track mixer and per-step
+// ratchet / probability / slide / length. v1 saves and links still load.
+export const STATE_VERSION = 2;
+export const BANKS = 4;
+export const BANK_NAMES = ["A", "B", "C", "D"];
+export const CHAIN_MAX = 16;
 export const BPM_MIN = 60;
 export const BPM_MAX = 200;
 export const SWING_MAX = 48;
@@ -39,8 +47,23 @@ export function defaultMetronome() {
   return { on: false, vol: 0.5 };
 }
 
+export function defaultMix() {
+  return { vol: 1, pan: 0, rev: 0, dly: 0 };
+}
+
+/** Attach the non-enumerable `pattern` alias (= banks[bank]); JSON never duplicates it. */
+export function withPatternAlias(obj) {
+  Object.defineProperty(obj, "pattern", {
+    get() { return this.banks[this.bank]; },
+    set(p) { this.banks[this.bank] = p; },
+    enumerable: false,
+    configurable: true,
+  });
+  return obj;
+}
+
 export function defaultState() {
-  return {
+  return withPatternAlias({
     v: STATE_VERSION,
     bpm: 100,
     swing: 0,
@@ -48,9 +71,16 @@ export function defaultState() {
     limiter: true,
     metronome: defaultMetronome(),
     patch: { ...DEFAULT_PATCH },
-    pattern: emptyPattern(STEPS),
-  };
+    banks: Array.from({ length: BANKS }, () => emptyPattern(STEPS)),
+    bank: 0,
+    chain: [0],
+    song: false,
+    mixer: TRACKS.map(defaultMix),
+  });
 }
+
+const round2 = (v) => Math.round(v * 100) / 100;
+const clampNum = (v, lo, hi, fallback) => (finite(v) ? Math.min(hi, Math.max(lo, round2(v))) : fallback);
 
 function sanitizeCell(raw, base) {
   const c = isObj(raw) ? raw : {};
@@ -59,7 +89,23 @@ function sanitizeCell(raw, base) {
     vel: finite(c.vel) ? roundVel(c.vel) : base.vel,
     note: clampInt(c.note, NOTE_MIN, NOTE_MAX, base.note),
     chordId: CHORD_SET.has(c.chordId) ? c.chordId : base.chordId,
+    rat: RATCHETS.includes(c.rat) ? c.rat : 1,
+    prob: PROBS.includes(c.prob) ? c.prob : 1,
+    slide: c.slide === true,
+    gate: GATES.includes(c.gate) ? c.gate : 0,
   };
+}
+
+export function sanitizeMixer(raw) {
+  return TRACKS.map((_, i) => {
+    const m = Array.isArray(raw) && isObj(raw[i]) ? raw[i] : {};
+    return {
+      vol: clampNum(m.vol, 0, 1, 1),
+      pan: clampNum(m.pan, -1, 1, 0),
+      rev: clampNum(m.rev, 0, 1, 0),
+      dly: clampNum(m.dly, 0, 1, 0),
+    };
+  });
 }
 
 export function sanitizePattern(raw) {
@@ -78,11 +124,22 @@ export function sanitizePattern(raw) {
   });
 }
 
-/** Strictly rebuild a state from untrusted data. Returns null if it is not a NOCTURNE state at all. */
+/**
+ * Strictly rebuild a state from untrusted data. Accepts v1 (single pattern)
+ * and v2 (banks). Returns null if it is not a NOCTURNE state at all.
+ * A `pattern` field, when present, replaces the current bank (v1 saves, AI beats).
+ */
 export function sanitizeState(raw) {
-  if (!isObj(raw) || raw.v !== STATE_VERSION) return null;
+  if (!isObj(raw) || (raw.v !== 1 && raw.v !== STATE_VERSION)) return null;
   const metro = isObj(raw.metronome) ? raw.metronome : {};
-  return {
+  const bank = raw.v === STATE_VERSION ? clampInt(raw.bank, 0, BANKS - 1, 0) : 0;
+  const rawBanks = raw.v === STATE_VERSION && Array.isArray(raw.banks) ? raw.banks : [];
+  const banks = Array.from({ length: BANKS }, (_, i) => sanitizePattern(rawBanks[i]));
+  if (Array.isArray(raw.pattern)) banks[bank] = sanitizePattern(raw.pattern);
+  const chain = (Array.isArray(raw.chain) ? raw.chain : [])
+    .filter((x) => Number.isInteger(x) && x >= 0 && x < BANKS)
+    .slice(0, CHAIN_MAX);
+  return withPatternAlias({
     v: STATE_VERSION,
     bpm: clampInt(raw.bpm, BPM_MIN, BPM_MAX, 100),
     swing: clampInt(raw.swing, 0, SWING_MAX, 0),
@@ -93,12 +150,17 @@ export function sanitizeState(raw) {
       vol: finite(metro.vol) ? Math.min(1, Math.max(0, Math.round(metro.vol * 100) / 100)) : 0.5,
     },
     patch: sanitizePatch(raw.patch),
-    pattern: sanitizePattern(raw.pattern),
-  };
+    banks,
+    bank,
+    chain: chain.length ? chain : [bank],
+    song: raw.song === true,
+    mixer: sanitizeMixer(raw.mixer),
+  });
 }
 
 /** Plain, JSON-safe snapshot of the parts of app state that are saved. */
 export function serializeState(s) {
+  const banks = Array.isArray(s.banks) ? s.banks : [s.pattern];
   return sanitizeState({
     v: STATE_VERSION,
     bpm: s.bpm,
@@ -107,69 +169,144 @@ export function serializeState(s) {
     limiter: s.limiter,
     metronome: s.metronome,
     patch: s.patch,
-    pattern: s.pattern,
+    banks,
+    bank: Array.isArray(s.banks) ? s.bank : 0,
+    chain: s.chain,
+    song: s.song,
+    mixer: s.mixer,
   });
 }
 
+/** True when a bank has nothing in it worth saving in a share link. */
+export function bankIsEmpty(pattern) {
+  const base = emptyPattern(STEPS);
+  return pattern.every((row, i) => !row.mute && !row.solo && row.source === base[i].source && row.steps.every((c) => !c.on));
+}
+
 // ---- Share links --------------------------------------------------------
-// Binary layout (v1):
-//   [1][bpm][swing][length][flags: bit0 limiter][wave]
+// Binary layout v2:
+//   [2][bpm][swing][length][flags: bit0 limiter, bit1 song][wave]
 //   7 x uint16 patch knobs
-//   12 x track: uint16 source index, flags (bit0 mute, bit1 solo),
-//               uint32 on-mask, then per on-step: vel(0-100), note, chord index
+//   [bank][chain length][chain bank indexes...]
+//   12 x mixer: vol(0-100) pan(0-200, 100 = centre) rev(0-100) dly(0-100)
+//   [bank mask: which of A-D follow]
+//   per bank: 12 x track: uint16 source index, flags (bit0 mute, bit1 solo),
+//     uint32 on-mask, then per on-step: vel(0-100), note, chord index,
+//     ext (bits0-2 ratchet idx, bit3 slide, bits4-6 gate idx), prob(0-100)
+// v1 links ([1]... one pattern, 3 bytes per step) still decode.
 export function packState(state) {
   const s = sanitizeState(state);
   if (!s) throw new Error("bad state");
-  const out = [STATE_VERSION, s.bpm, s.swing, s.length, s.limiter ? 1 : 0, WAVE_IDS.indexOf(s.patch.wave)];
+  const out = [STATE_VERSION, s.bpm, s.swing, s.length, (s.limiter ? 1 : 0) | (s.song ? 2 : 0), WAVE_IDS.indexOf(s.patch.wave)];
   for (const k of PATCH_KEYS) {
     const q = Math.round(s.patch[k] * 65535);
     out.push(q >> 8, q & 255);
   }
-  for (const row of s.pattern) {
-    const si = SOURCE_IDS.indexOf(row.source);
-    out.push(si >> 8, si & 255, (row.mute ? 1 : 0) | (row.solo ? 2 : 0));
-    let mask = 0;
-    row.steps.forEach((c, j) => { if (c.on) mask |= 1 << j; });
-    out.push((mask >>> 24) & 255, (mask >>> 16) & 255, (mask >>> 8) & 255, mask & 255);
-    for (const c of row.steps) {
-      if (!c.on) continue;
-      out.push(Math.round(c.vel * 100), c.note, Math.max(0, CHORD_IDS.indexOf(c.chordId)));
+  out.push(s.bank, s.chain.length, ...s.chain);
+  for (const m of s.mixer) out.push(Math.round(m.vol * 100), Math.round(m.pan * 100) + 100, Math.round(m.rev * 100), Math.round(m.dly * 100));
+  let bankMask = 0;
+  s.banks.forEach((p, i) => { if (i === s.bank || !bankIsEmpty(p)) bankMask |= 1 << i; });
+  out.push(bankMask);
+  s.banks.forEach((pattern, b) => {
+    if (!(bankMask & (1 << b))) return;
+    for (const row of pattern) {
+      const si = SOURCE_IDS.indexOf(row.source);
+      out.push(si >> 8, si & 255, (row.mute ? 1 : 0) | (row.solo ? 2 : 0));
+      let mask = 0;
+      row.steps.forEach((c, j) => { if (c.on) mask |= 1 << j; });
+      out.push((mask >>> 24) & 255, (mask >>> 16) & 255, (mask >>> 8) & 255, mask & 255);
+      for (const c of row.steps) {
+        if (!c.on) continue;
+        const ext = RATCHETS.indexOf(c.rat) | (c.slide ? 8 : 0) | (GATES.indexOf(c.gate) << 4);
+        out.push(Math.round(c.vel * 100), c.note, Math.max(0, CHORD_IDS.indexOf(c.chordId)), ext, Math.round(c.prob * 100));
+      }
     }
-  }
+  });
   return Uint8Array.from(out);
 }
 
-export function unpackState(bytes) {
+function reader(bytes) {
   let i = 0;
   const need = (n) => { if (i + n > bytes.length) throw new Error("truncated"); };
   const u8 = () => { need(1); return bytes[i++]; };
   const u16 = () => (u8() << 8) | u8();
-  if (u8() !== STATE_VERSION) throw new Error("version");
-  const raw = { v: STATE_VERSION, bpm: u8(), swing: u8(), length: u8() };
-  raw.limiter = (u8() & 1) === 1;
-  const wave = WAVE_IDS[u8()];
+  const u32 = () => ((u8() << 24) | (u8() << 16) | (u8() << 8) | u8()) >>> 0;
+  return { u8, u16, u32, done: () => i === bytes.length };
+}
+
+function readHeader(r, raw) {
+  raw.bpm = r.u8();
+  raw.swing = r.u8();
+  raw.length = r.u8();
+  const flags = r.u8();
+  raw.limiter = (flags & 1) === 1;
+  raw.song = (flags & 2) === 2;
+  const wave = WAVE_IDS[r.u8()];
   if (!wave) throw new Error("wave");
   raw.patch = { wave };
-  for (const k of PATCH_KEYS) raw.patch[k] = u16() / 65535;
-  const base = emptyPattern(STEPS);
-  raw.pattern = base.map((def) => {
-    const source = SOURCE_IDS[u16()];
+  for (const k of PATCH_KEYS) raw.patch[k] = r.u16() / 65535;
+}
+
+function readPattern(r, v2) {
+  return emptyPattern(STEPS).map((def) => {
+    const source = SOURCE_IDS[r.u16()];
     if (!source) throw new Error("source");
-    const flags = u8();
-    const mask = ((u8() << 24) | (u8() << 16) | (u8() << 8) | u8()) >>> 0;
+    const flags = r.u8();
+    const mask = r.u32();
     const steps = def.steps.map((cell, j) => {
       if (!(mask & (1 << j))) return cell;
-      const vel = u8() / 100;
-      const note = u8();
-      const chordId = CHORD_IDS[u8()];
+      const vel = r.u8() / 100;
+      const note = r.u8();
+      const chordId = CHORD_IDS[r.u8()];
       if (vel <= 0 || vel > 1 || !chordId) throw new Error("cell");
-      return { on: true, vel, note, chordId };
+      if (!v2) return { ...cell, on: true, vel, note, chordId };
+      const ext = r.u8();
+      const prob = r.u8() / 100;
+      const rat = RATCHETS[ext & 7];
+      const gate = GATES[(ext >> 4) & 7];
+      if (rat === undefined || gate === undefined || (ext & 0x80) || !PROBS.includes(prob)) throw new Error("ext");
+      return { ...cell, on: true, vel, note, chordId, rat, prob, slide: (ext & 8) === 8, gate };
     });
     return { ...def, source, mute: (flags & 1) === 1, solo: (flags & 2) === 2, steps };
   });
-  if (i !== bytes.length) throw new Error("trailing bytes");
+}
+
+export function unpackState(bytes) {
+  const r = reader(bytes);
+  const version = r.u8();
+  if (version !== 1 && version !== STATE_VERSION) throw new Error("version");
+  const raw = { v: version };
+  readHeader(r, raw);
+  if (version === 1) {
+    raw.pattern = readPattern(r, false);
+  } else {
+    raw.bank = r.u8();
+    if (raw.bank >= BANKS) throw new Error("bank");
+    const chainLen = r.u8();
+    if (chainLen < 1 || chainLen > CHAIN_MAX) throw new Error("chain");
+    raw.chain = Array.from({ length: chainLen }, () => r.u8());
+    if (raw.chain.some((x) => x >= BANKS)) throw new Error("chain");
+    raw.mixer = TRACKS.map(() => {
+      const vol = r.u8(), pan = r.u8(), rev = r.u8(), dly = r.u8();
+      if (vol > 100 || pan > 200 || rev > 100 || dly > 100) throw new Error("mixer");
+      return { vol: vol / 100, pan: (pan - 100) / 100, rev: rev / 100, dly: dly / 100 };
+    });
+    const bankMask = r.u8();
+    if (bankMask > 15 || !(bankMask & (1 << raw.bank))) throw new Error("banks");
+    raw.banks = Array.from({ length: BANKS }, (_, b) => (bankMask & (1 << b) ? readPattern(r, true) : null));
+  }
+  if (!r.done()) throw new Error("trailing bytes");
   // Range checks (bpm, note, length...) are enforced by sanitizeState.
   return sanitizeState(raw);
+}
+
+/** Compact, comparable undo snapshot (binary state as a string). */
+export function snapshotOf(state) {
+  return String.fromCharCode(...packState(serializeState(state)));
+}
+
+export function stateFromSnapshot(snap) {
+  return unpackState(Uint8Array.from(snap, (ch) => ch.charCodeAt(0)));
 }
 
 function toB64url(bytes) {
@@ -228,6 +365,28 @@ export async function decodeShare(code) {
 export function shareCodeFromHash(hash) {
   const m = /^#?(?:.*&)?s=([A-Za-z0-9_-]+)/.exec(hash || "");
   return m ? m[1] : null;
+}
+
+// ---- Local storage (autosave + saved slots) --------------------------------
+// Four banks as JSON are ~140 KB; the packed form is well under 1 KB, so 30
+// saved beats fit easily in localStorage. Older JSON saves (v1/v2) still load.
+export function toStored(state) {
+  const s = serializeState(state);
+  return { v: STATE_VERSION, p: toB64url(packState(s)), metronome: s.metronome };
+}
+
+export function fromStored(raw) {
+  if (!isObj(raw)) return null;
+  if (typeof raw.p === "string" && raw.p.length <= MAX_SHARE_CHARS * 2) {
+    try {
+      const s = unpackState(fromB64url(raw.p));
+      if (s && isObj(raw.metronome)) s.metronome = sanitizeState({ v: STATE_VERSION, metronome: raw.metronome }).metronome;
+      return s;
+    } catch {
+      return null;
+    }
+  }
+  return sanitizeState(raw);
 }
 
 // ---- Undo / redo ----------------------------------------------------------
