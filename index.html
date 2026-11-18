@@ -122,7 +122,22 @@
     .ms.on { background: var(--cyan); color: #111; border-color: var(--cyan); }
     .src { font-size: 9px; padding: 4px; width: 100%; background: #18181e; color: var(--fg); }
     .step { height: 32px; border-radius: 6px; padding: 0; font-size: 8px; color: #6d6d7a; }
+    .step { -webkit-touch-callout: none; user-select: none; -webkit-user-select: none; }
     .step.on { background: var(--cyan); border-color: var(--cyan); color: #102226; }
+    /* Velocity: quieter steps are dimmer (40% -> faint, 100% -> full cyan). */
+    @supports (background: color-mix(in srgb, red 50%, blue)) {
+      .step.on { background: color-mix(in srgb, var(--cyan) calc(var(--vel, 1) * 100%), #13131a); }
+    }
+    .mini { border: 1px solid var(--border); background: #18181e; color: var(--fg); border-radius: 999px; padding: 4px 9px; font-size: 10px; letter-spacing: .12em; cursor: pointer; }
+    .mini.on { background: var(--orange); color: #111; border-color: var(--orange); }
+    .mini:disabled { opacity: .4; cursor: default; }
+    .num { width: 52px; background: #0b0b10; color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 2px 4px; }
+    #bpm-pill.pulse { border-color: #7d9b8c; }
+    #bpm-pill.pulse-accent { border-color: var(--orange); box-shadow: 0 0 0 1px var(--orange); }
+    .slots { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 10px; }
+    .slots input, .slots select { background: #0b0b10; color: var(--fg); border: 1px solid var(--border); border-radius: 8px; padding: 6px 8px; font-size: 11px; min-width: 0; }
+    #snack { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(16px + var(--safe-bottom)); z-index: 60; display: flex; gap: 10px; align-items: center; background: #1b1b22; border: 1px solid var(--border); border-radius: 12px; padding: 10px 14px; font-size: 12px; max-width: calc(100vw - 32px); }
+    #snack[hidden] { display: none; }
     .step.beat { box-shadow: inset 0 0 0 1px #3a3a48; }
     .step.now { outline: 1px solid var(--orange); }
     .note-strip, .hint { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
@@ -145,13 +160,15 @@
       <canvas id="mini-freq" class="mini" width="140" height="36"></canvas>
     </div>
     <div class="controls">
-      <div class="pill"><label>BPM</label><input id="bpm" type="range" min="70" max="160" value="100"><b id="bpm-val">100</b></div>
+      <div class="pill" id="bpm-pill"><label for="bpm-num">BPM</label><input id="bpm" type="range" min="60" max="200" value="100" aria-label="Tempo"><input id="bpm-num" class="num" type="number" min="60" max="200" step="1" value="100" inputmode="numeric" aria-label="Tempo in BPM"><button class="mini" id="tap" type="button" title="Tap 2+ times to set the tempo">TAP</button></div>
       <div class="pill"><label>SWING</label><input id="swing" type="range" min="0" max="48" value="0"><b id="swing-val">0</b></div>
       <div class="pill"><label>VOL</label><input id="vol" type="range" min="0" max="1" step="0.01" value="0.85"></div>
       <button class="btn" id="play" type="button">PLAY</button>
       <button class="btn on" id="limiter" type="button">LIMITER</button>
       <button class="btn" id="crt" type="button">CRT</button>
       <button class="btn" id="rec" type="button">○ REC</button>
+      <div class="pill"><button class="mini" id="metro" type="button" aria-pressed="false" title="Metronome: speakers only, never recorded. Counts in one bar before REC.">METRO</button><input id="metro-vol" type="range" min="0" max="1" step="0.05" value="0.5" aria-label="Metronome volume"></div>
+      <div class="pill"><button class="mini" id="undo" type="button" title="Undo (Ctrl/Cmd+Z)" disabled>UNDO</button><button class="mini" id="redo" type="button" title="Redo (Shift+Ctrl/Cmd+Z)" disabled>REDO</button><button class="mini" id="share" type="button" title="Copy or share a link to this beat">SHARE</button></div>
     </div>
   </header>
   <main>
@@ -190,7 +207,7 @@
 
     <section class="panel">
       <div class="row">
-        <h2 class="grotesk">KEYBOARD <span>C2–C4 · A W S D + BLACK KEYS · PLAYS THE PIT PATCH</span></h2>
+        <h2 class="grotesk">KEYBOARD <span>C2–C4 · KEYS A S D F G H J K L ; ' · BLACK KEYS W E T Y U O P · Z/X OCTAVE</span></h2>
         <div class="oct">
           <button class="btn" id="oct-down" type="button">OCT −</button>
           <b id="oct-val">3</b>
@@ -202,7 +219,7 @@
 
     <section class="panel">
       <div class="row">
-        <h2 class="grotesk">TRAP DRUMS <span>Q W E R T Y U I</span></h2>
+        <h2 class="grotesk">TRAP DRUMS <span>KEYS 1–8</span></h2>
         <div class="controls">
           <div id="hat-divs"></div>
           <button class="btn" id="hat-roll" type="button">HAT ROLL</button>
@@ -228,7 +245,7 @@
 
     <section class="panel">
       <div class="row">
-        <h2 class="grotesk">STEP SEQUENCER <span id="seq-title">12 TRACKS × 16 — LOOKAHEAD 25ms</span></h2>
+        <h2 class="grotesk">STEP SEQUENCER <span id="seq-title">12 TRACKS × 16</span></h2>
         <div class="controls">
           <span class="hint">LEN</span>
           <button class="btn on" data-len="8" type="button">8</button>
@@ -240,7 +257,14 @@
         </div>
       </div>
       <div class="note-strip" id="presets"></div>
-      <p class="hint">Select a track, pick a note or chord, then tap steps. Right-click (or long-press) a step to raise velocity. 808 and chord tracks store a pitch per step.</p>
+      <div class="slots">
+        <input id="slot-name" type="text" maxlength="40" placeholder="Beat name" aria-label="Beat name">
+        <button class="btn" id="slot-save" type="button">SAVE</button>
+        <select id="slot-list" aria-label="Saved beats"></select>
+        <button class="btn" id="slot-load" type="button">LOAD</button>
+        <button class="btn" id="slot-del" type="button">DELETE</button>
+      </div>
+      <p class="hint">Select a track, pick a note or chord, then tap steps. Hold, right-click or shift-click a step to cycle its velocity (40 → 60 → 80 → 100%); brighter = louder. Everything autosaves; CLEAR, RANDOMIZE and presets can be undone. 808 and chord tracks store a pitch per step.</p>
       <div class="note-strip" id="paint-notes"></div>
       <div class="seq-wrap">
         <div class="seq" id="seq"></div>
@@ -248,6 +272,7 @@
       <p id="toast"></p>
     </section>
   </main>
+  <div id="snack" role="status" aria-live="polite" hidden><span id="snack-msg"></span><button class="mini" id="snack-undo" type="button">UNDO</button></div>
   <script type="module" src="./app.js"></script>
 </body>
 </html>

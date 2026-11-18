@@ -8,6 +8,7 @@ import {
   sourceIsChord,
   pitWaveFromSource,
 } from "./music.mjs";
+import { pickRecordType, extensionForType } from "./state-io.mjs";
 
 function distortionCurve(amount) {
   const n = 256;
@@ -83,6 +84,19 @@ function ceilingCurve(ceiling = SAFETY_CEILING, knee = 0.8 * SAFETY_CEILING) {
   }
   return curve;
 }
+
+// Identity up to `ceiling`, flat above it (inputs beyond +/-1 land on the ends).
+function hardCeilingCurve(ceiling) {
+  const n = 4097;
+  const curve = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const x = (i / (n - 1)) * 2 - 1;
+    curve[i] = Math.max(-ceiling, Math.min(ceiling, x));
+  }
+  return curve;
+}
+
+export const METRO_MAX = 0.3; // click peak at full metronome volume
 
 // Fold sub-sonic fundamentals up by octaves so the note name stays the same
 // but nothing below ~30 Hz is asked of the speaker.
@@ -288,7 +302,20 @@ export class Studio {
     this.safetyIn = this.post;
     this.safetyLimiter = brick;
     this.out = ceiling;
-    this.out.connect(ctx.destination);
+    // Speaker bus: music (`out`, which is also what REC captures) plus the
+    // metronome. The metronome joins *after* the recording tap, so clicks are
+    // never recorded. A final identity-below-ceiling clamp keeps music
+    // bit-exact while guaranteeing music + click never exceeds the ceiling.
+    this.metroBus = ctx.createGain();
+    this.metroBus.gain.value = 0;
+    this.speakerSum = ctx.createGain();
+    const clamp = ctx.createWaveShaper();
+    clamp.curve = hardCeilingCurve(SAFETY_CEILING);
+    clamp.oversample = "none";
+    this.out.connect(this.speakerSum);
+    this.metroBus.connect(this.speakerSum);
+    this.speakerSum.connect(clamp);
+    clamp.connect(ctx.destination);
   }
 
   // Mix path: master -> trim -> (musical LIMITER, optional) -> safety stage.
@@ -1378,22 +1405,52 @@ export class Studio {
     }
   }
 
+  // ---- Metronome (speakers only, never recorded) ----
+  setMetronomeVolume(vol) {
+    if (!this.metroBus) return;
+    const v = Math.min(1, Math.max(0, vol)) * METRO_MAX;
+    this.metroBus.gain.setTargetAtTime(v, this.ctx.currentTime, 0.01);
+  }
+
+  click(when, accent = false) {
+    if (!this.ctx || !this.metroBus) return;
+    const c = this.ctx;
+    const t = Math.max(when, c.currentTime);
+    const osc = c.createOscillator();
+    osc.type = "sine";
+    osc.frequency.value = accent ? 1600 : 1000;
+    const g = c.createGain();
+    g.gain.setValueAtTime(0, t);
+    g.gain.linearRampToValueAtTime(accent ? 1 : 0.6, t + 0.002);
+    g.gain.exponentialRampToValueAtTime(0.0005, t + 0.03);
+    g.gain.linearRampToValueAtTime(0, t + 0.035);
+    osc.connect(g);
+    g.connect(this.metroBus);
+    osc.start(t);
+    osc.stop(t + 0.04);
+    osc.onended = () => { try { g.disconnect(); } catch { /* gone */ } };
+  }
+
   async toggleRecord() {
     if (!this.arm() || !this.recDest) return false;
     if (!this.recorder) {
       this.recChunks = [];
       this.setRecTap(true);
-      const rec = new MediaRecorder(this.recDest.stream);
+      // Safari records MP4/AAC, Chrome/Firefox WebM/Opus: ask, don't assume.
+      const wanted = pickRecordType(typeof MediaRecorder.isTypeSupported === "function" ? (t) => MediaRecorder.isTypeSupported(t) : null);
+      const rec = wanted ? new MediaRecorder(this.recDest.stream, { mimeType: wanted }) : new MediaRecorder(this.recDest.stream);
       rec.ondataavailable = (e) => {
         if (e.data.size > 0) this.recChunks.push(e.data);
       };
       rec.onstop = () => {
         this.setRecTap(false);
-        const blob = new Blob(this.recChunks, { type: "audio/webm" });
+        const type = rec.mimeType || wanted || this.recChunks[0]?.type || "audio/webm";
+        const blob = new Blob(this.recChunks, { type });
+        this.lastRecording = blob;
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
-        a.download = `nocturne-808-${Date.now()}.webm`;
+        a.download = `nocturne-808-${Date.now()}.${extensionForType(type)}`;
         a.click();
       };
       rec.start();
