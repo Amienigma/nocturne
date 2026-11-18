@@ -47,6 +47,8 @@ import {
   BPM_MIN,
   BPM_MAX,
 } from "./src/state-io.mjs";
+import { renderWav, EXPORT_BARS } from "./src/export.mjs";
+import { AI_ENDPOINT, buildBeatPrompt, extractJson, beatFromAi, RateLimiter } from "./src/beat-ai.mjs";
 
 const studio = getStudio();
 const state = {
@@ -287,11 +289,12 @@ function deleteSlot() {
 let snackTimer = 0;
 let snackAction = null;
 
-function showSnack(msg, withUndo = false, customUndo = null) {
+function showSnack(msg, withUndo = false, customUndo = null, actionLabel = "UNDO") {
   const el = $("snack");
   $("snack-msg").textContent = msg;
   snackAction = customUndo || (withUndo ? undo : null);
   $("snack-undo").hidden = !snackAction;
+  $("snack-undo").textContent = actionLabel;
   el.hidden = false;
   clearTimeout(snackTimer);
   snackTimer = window.setTimeout(() => { el.hidden = true; }, 5000);
@@ -329,6 +332,167 @@ async function loadShareFromHash() {
   }
   commit(() => applyState(shared, { keepMetronome: true }), "Loaded shared beat");
   saveNow();
+}
+
+// ---- WAV export ----
+let exporting = false;
+
+function wavName() {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  return `nocturne-${state.bpm}bpm-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}.wav`;
+}
+
+function downloadBlob(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+
+async function deliverFile(blob, name) {
+  const file = typeof File === "function" ? new File([blob], name, { type: blob.type }) : null;
+  const canShareFile = file && navigator.canShare && navigator.share && navigator.canShare({ files: [file] });
+  if (canShareFile) {
+    try {
+      await navigator.share({ files: [file], title: name, text: "Made with NOCTURNE" });
+      return "shared";
+    } catch (e) {
+      if (e && e.name === "AbortError") return "cancelled";
+      // Safari needs a fresh tap if rendering took too long: offer one.
+      if (e && e.name === "NotAllowedError") {
+        showSnack("WAV ready", false, () => { void deliverFile(blob, name); }, "SAVE");
+        return "pending";
+      }
+    }
+  }
+  downloadBlob(blob, name);
+  return "downloaded";
+}
+
+async function exportWav() {
+  if (exporting) return;
+  exporting = true;
+  const btn = $("export");
+  const prog = $("exp-prog");
+  const status = $("exp-status");
+  const bars = EXPORT_BARS.includes(Number($("exp-bars").value)) ? Number($("exp-bars").value) : 4;
+  const bitDepth = $("exp-bits").value === "24" ? 24 : 16;
+  btn.disabled = true;
+  prog.hidden = false;
+  prog.value = 0;
+  status.textContent = "Rendering…";
+  try {
+    const snap = serializeState(state);
+    const res = await renderWav(snap, {
+      bars,
+      bitDepth,
+      masterGain: Number($("vol").value),
+      onProgress: (p) => { prog.value = p; status.textContent = `Rendering… ${Math.round(p * 100)}%`; },
+    });
+    window.__lastExport = res; // for tests/debugging
+    const name = wavName();
+    const sizeMb = (res.blob.size / 1048576).toFixed(1);
+    const how = await deliverFile(res.blob, name);
+    status.textContent = how === "cancelled" ? "Export cancelled" : `${name} · ${res.seconds.toFixed(1)} s · ${sizeMb} MB`;
+  } catch (e) {
+    status.textContent = `Export failed: ${e?.message || e}`;
+  } finally {
+    prog.hidden = true;
+    btn.disabled = false;
+    exporting = false;
+  }
+}
+
+// ---- Amienigma AI beat writer ----
+const aiLimiter = new RateLimiter({ cooldownMs: 15000, windowMs: 600000, max: 6 });
+const AI_TIMEOUT_MS = 60000;
+
+async function askAi(prompt) {
+  const ctrl = new AbortController();
+  const timer = window.setTimeout(() => ctrl.abort(), AI_TIMEOUT_MS);
+  try {
+    // text/plain keeps this a CORS "simple request" (no preflight); the API parses the JSON body.
+    const res = await fetch(AI_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=UTF-8" },
+      body: JSON.stringify({ messages: [{ role: "user", content: prompt }] }),
+      signal: ctrl.signal,
+      credentials: "omit",
+      mode: "cors",
+    });
+    const text = await res.text();
+    return { ok: res.ok, status: res.status, text };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function writeBeat(e) {
+  e?.preventDefault();
+  const input = $("ai-prompt");
+  const status = $("ai-status");
+  const go = $("ai-go");
+  const desc = input.value.trim();
+  if (!desc) {
+    status.textContent = "Describe the beat first, e.g. “dark Memphis trap, 140”.";
+    input.focus();
+    return;
+  }
+  const wait = aiLimiter.wait(Date.now());
+  if (wait > 0) {
+    status.textContent = Number.isFinite(wait) ? `Give it ${Math.ceil(wait / 1000)} s before the next beat.` : "Still writing the last one…";
+    return;
+  }
+  if (navigator.onLine === false) {
+    status.textContent = "You're offline. The beat writer needs a connection; everything else works offline.";
+    return;
+  }
+  aiLimiter.start(Date.now());
+  go.disabled = true;
+  status.textContent = "Amienigma AI is writing your beat…";
+  try {
+    const prompt = buildBeatPrompt(desc);
+    let beat = null;
+    let lastErr = "";
+    // The model occasionally returns an empty or cut-off reply: one retry.
+    for (let attempt = 0; attempt < 2 && !beat; attempt++) {
+      const res = await askAi(prompt);
+      if (!res.ok) {
+        lastErr = res.status === 429 ? "Amienigma AI is busy. Try again in a minute." : "Amienigma AI didn't answer this time.";
+        if (res.status === 429 || res.status === 400) break;
+        continue;
+      }
+      try {
+        beat = beatFromAi(extractJson(res.text), state);
+      } catch (err) {
+        lastErr = err.message;
+      }
+    }
+    if (!beat) {
+      status.textContent = `${lastErr || "No beat came back."} Try again or rephrase.`;
+      return;
+    }
+    commit(() => applyState(beat, UNDO_KEEP), "Loaded AI beat");
+    state.preset = null;
+    renderPresets();
+    status.textContent = `Loaded: ${beat.bpm} BPM, ${beat.length} steps. Press PLAY, or UNDO to go back.`;
+  } catch (err) {
+    // A TypeError here means the browser blocked the response (CORS) or the network failed.
+    status.innerHTML = "";
+    status.append(
+      err?.name === "AbortError" ? "Amienigma AI took too long. " : "Couldn't reach Amienigma AI from this page. ",
+      Object.assign(document.createElement("a"), { href: AI_ENDPOINT.replace(/api\/chat$/, ""), target: "_blank", rel: "noopener", textContent: "Open Amienigma AI" }),
+      " instead; everything else keeps working.",
+    );
+  } finally {
+    aiLimiter.done();
+    go.disabled = false;
+  }
 }
 
 function arm() {
@@ -628,6 +792,7 @@ function renderPresets() {
       commit(() => { state.pattern = applyPreset(name, state.length); }, `Loaded preset ${name}`);
       renderPresets();
       renderSeq();
+      renderPaint();
     });
     root.appendChild(btn);
   }
@@ -669,138 +834,274 @@ function renderPaint() {
 }
 
 let suppressStepClickUntil = 0;
+let seqBuiltFor = -1; // pattern length the grid DOM was built for
+let seqCells = []; // seqCells[track][step] -> button
+let seqMeta = []; // seqMeta[track] -> { row, mute, solo, name }
+let holdTimer = 0;
+let holdStart = null;
 
-function renderSeq() {
+const focusQuery = window.matchMedia("(max-width: 600px)");
+const isFocusView = () => focusQuery.matches;
+
+function sourceLabel(id) {
+  for (const group of SOURCE_GROUPS) {
+    const item = group.items.find((x) => x.id === id);
+    if (item) return item.label;
+  }
+  return id;
+}
+
+function cellText(row, cell) {
+  if (!cell.on || !sourceIsMelodic(row.source)) return "";
+  return sourceIsChord(row.source) ? (HITS.find((h) => h.id === cell.chordId)?.symbol || "•") : noteName(cell.note);
+}
+
+// Update one step button in place (no grid rebuild on a tap).
+function updateCell(track, step) {
+  const btn = seqCells[track]?.[step];
+  if (!btn) return;
+  const row = state.pattern[track];
+  const cell = row.steps[step];
+  btn.classList.toggle("on", cell.on);
+  const text = cellText(row, cell);
+  if (btn.textContent !== text) btn.textContent = text;
+  btn.style.setProperty("--vel", String(cell.vel));
+  btn.setAttribute("aria-pressed", String(cell.on));
+  btn.setAttribute("aria-label", `${TRACKS[track]} step ${step + 1}${cell.on ? `, velocity ${Math.round(cell.vel * 100)}%` : ""}`);
+  btn.title = cell.on ? `Velocity ${Math.round(cell.vel * 100)}% · hold, right-click or shift-click to change` : "";
+}
+
+function updateRow(track) {
+  const meta = seqMeta[track];
+  const row = state.pattern[track];
+  if (meta) {
+    meta.mute.classList.toggle("on", row.mute);
+    meta.mute.setAttribute("aria-pressed", String(row.mute));
+    meta.solo.classList.toggle("on", row.solo);
+    meta.solo.setAttribute("aria-pressed", String(row.solo));
+    meta.name.textContent = `${TRACKS[track]} · ${sourceLabel(row.source)}`;
+    meta.row.classList.toggle("sel", track === state.selectedTrack);
+  }
+  for (let step = 0; step < state.length; step++) updateCell(track, step);
+}
+
+function buildSeq() {
   const root = $("seq");
   root.style.setProperty("--steps", String(state.length));
+  root.innerHTML = "";
+  seqCells = [];
+  seqMeta = [];
+  state.pattern.forEach((row, track) => {
+    const line = document.createElement("div");
+    line.className = "seq-row";
+    line.dataset.t = String(track);
+    const meta = document.createElement("div");
+    meta.className = "track-meta";
+    const mk = (cls, text, act, label) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = cls;
+      b.textContent = text;
+      b.dataset.act = act;
+      b.dataset.t = String(track);
+      if (label) b.setAttribute("aria-label", label);
+      return b;
+    };
+    const mute = mk("ms", "M", "mute", `Mute ${TRACKS[track]}`);
+    const solo = mk("ms", "S", "solo", `Solo ${TRACKS[track]}`);
+    const name = mk("trk", "", "sel", null);
+    meta.append(mute, solo, name);
+    line.appendChild(meta);
+    const cells = [];
+    for (let step = 0; step < state.length; step++) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = `step${step % 4 === 0 ? " beat" : ""}`;
+      btn.dataset.t = String(track);
+      btn.dataset.s = String(step);
+      cells.push(btn);
+      line.appendChild(btn);
+    }
+    seqCells.push(cells);
+    seqMeta.push({ row: line, mute, solo, name });
+    root.appendChild(line);
+  });
+  seqBuiltFor = state.length;
+  cacheStepColumns();
+}
+
+/** Bring the grid in line with state: rebuild only when the length changed. */
+function renderSeq() {
+  if (seqBuiltFor !== state.length || seqCells.length !== state.pattern.length) buildSeq();
   $("seq-title").textContent = `12 TRACKS × ${state.length}`;
   document.querySelectorAll("[data-len]").forEach((el) => {
     el.classList.toggle("on", Number(el.dataset.len) === state.length);
   });
-  root.innerHTML = "";
-  state.pattern.forEach((row, track) => {
-    const line = document.createElement("div");
-    line.className = "seq-row";
-    const meta = document.createElement("div");
-    meta.className = "track-meta";
-    const mute = document.createElement("button");
-    mute.type = "button";
-    mute.className = `ms${row.mute ? " on" : ""}`;
-    mute.textContent = "M";
-    mute.addEventListener("click", () => {
-      commit(() => { row.mute = !row.mute; });
-      renderSeq();
-    });
-    const solo = document.createElement("button");
-    solo.type = "button";
-    solo.className = `ms${row.solo ? " on" : ""}`;
-    solo.textContent = "S";
-    solo.addEventListener("click", () => {
-      commit(() => { row.solo = !row.solo; });
-      renderSeq();
-    });
-    const select = document.createElement("select");
-    select.className = "src";
-    select.title = TRACKS[track];
-    for (const group of SOURCE_GROUPS) {
-      const og = document.createElement("optgroup");
-      og.label = `${TRACKS[track]} · ${group.label}`;
-      for (const item of group.items) {
-        const opt = document.createElement("option");
-        opt.value = item.id;
-        opt.textContent = `${TRACKS[track]} · ${item.label}`;
-        og.appendChild(opt);
-      }
-      select.appendChild(og);
-    }
-    select.value = row.source;
-    select.addEventListener("change", () => {
-      commit(() => { state.pattern = setTrackSource(state.pattern, track, select.value); });
-      state.selectedTrack = track;
-      renderSeq();
-      renderPaint();
-    });
-    select.addEventListener("focus", () => {
-      state.selectedTrack = track;
-      renderPaint();
-    });
-    meta.append(mute, solo, select);
-    line.appendChild(meta);
-    for (let step = 0; step < state.length; step++) {
-      const cell = row.steps[step];
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = `step${cell.on ? " on" : ""}${step % 4 === 0 ? " beat" : ""}${state.currentStep === step ? " now" : ""}`;
-      if (cell.on && sourceIsMelodic(row.source)) {
-        btn.textContent = sourceIsChord(row.source) ? (HITS.find((h) => h.id === cell.chordId)?.symbol || "•") : noteName(cell.note);
-      }
-      btn.style.setProperty("--vel", String(cell.vel));
-      btn.setAttribute("aria-pressed", String(cell.on));
-      btn.setAttribute("aria-label", `${TRACKS[track]} step ${step + 1}${cell.on ? `, velocity ${Math.round(cell.vel * 100)}%` : ""}`);
-      if (cell.on) btn.title = `Velocity ${Math.round(cell.vel * 100)}% · hold, right-click or shift-click to change`;
-      const preview = () => {
-        const c = state.pattern[track].steps[step];
-        if (c.on && arm()) studio.triggerSource(state.pattern[track].source, c, studio.ctx.currentTime, c.vel);
-      };
-      const paint = () => {
-        state.selectedTrack = track;
-        commit(() => {
-          state.pattern = toggleStep(state.pattern, track, step, {
-            note: state.paintNote,
-            chordId: state.paintChord,
-            vel: cell.vel,
-            forceOn: cell.on ? null : true,
-          });
-        });
-        renderSeq();
-        renderPaint();
-        preview();
-      };
-      const cycleVel = () => {
-        state.selectedTrack = track;
-        commit(() => { state.pattern = cycleStepVelocity(state.pattern, track, step); });
-        renderSeq();
-        preview();
-      };
-      // A hold cycles velocity and must not also toggle the step on release,
-      // and the touch long-press "contextmenu" that some browsers fire after it
-      // must not cycle a second time.
-      let holdTimer = 0;
-      const cancelHold = () => {
-        if (holdTimer) clearTimeout(holdTimer);
-        holdTimer = 0;
-      };
-      btn.addEventListener("pointerdown", (e) => {
-        if (e.button !== 0) return;
-        cancelHold();
-        holdTimer = window.setTimeout(() => {
-          holdTimer = 0;
-          suppressStepClickUntil = performance.now() + 700;
-          cycleVel();
-        }, 420);
-      });
-      btn.addEventListener("pointerup", cancelHold);
-      btn.addEventListener("pointercancel", cancelHold);
-      btn.addEventListener("pointerleave", cancelHold);
-      btn.addEventListener("click", (e) => {
-        if (performance.now() < suppressStepClickUntil) return;
-        if (e.shiftKey) {
-          cycleVel();
-          return;
-        }
-        paint();
-      });
-      btn.addEventListener("contextmenu", (e) => {
-        e.preventDefault();
-        if (performance.now() < suppressStepClickUntil) return;
-        cycleVel();
-      });
-      line.appendChild(btn);
-    }
-    root.appendChild(line);
-  });
-  cacheStepColumns();
+  for (let t = 0; t < state.pattern.length; t++) updateRow(t);
+  renderTrackBar();
 }
+
+function renderTrackBar() {
+  const t = state.selectedTrack;
+  const row = state.pattern[t];
+  if (!row) return;
+  $("trk-pick").value = String(t);
+  $("trk-src").value = row.source;
+  $("trk-mute").classList.toggle("on", row.mute);
+  $("trk-mute").setAttribute("aria-pressed", String(row.mute));
+  $("trk-solo").classList.toggle("on", row.solo);
+  $("trk-solo").setAttribute("aria-pressed", String(row.solo));
+  seqMeta.forEach((m, i) => m.row.classList.toggle("sel", i === t));
+}
+
+function selectTrack(t) {
+  const n = state.pattern.length;
+  state.selectedTrack = ((t % n) + n) % n;
+  renderTrackBar();
+  renderPaint();
+}
+
+function initTrackBar() {
+  const pick = $("trk-pick");
+  TRACKS.forEach((name, i) => {
+    const opt = document.createElement("option");
+    opt.value = String(i);
+    opt.textContent = `${i + 1}. ${name}`;
+    pick.appendChild(opt);
+  });
+  // One shared sound picker for the selected track instead of 12 big selects.
+  const src = $("trk-src");
+  for (const group of SOURCE_GROUPS) {
+    const og = document.createElement("optgroup");
+    og.label = group.label;
+    for (const item of group.items) {
+      const opt = document.createElement("option");
+      opt.value = item.id;
+      opt.textContent = item.label;
+      og.appendChild(opt);
+    }
+    src.appendChild(og);
+  }
+  pick.addEventListener("change", () => selectTrack(Number(pick.value)));
+  src.addEventListener("change", () => {
+    const t = state.selectedTrack;
+    commit(() => { state.pattern = setTrackSource(state.pattern, t, src.value); });
+    updateRow(t);
+    renderTrackBar();
+    renderPaint();
+  });
+  $("trk-prev").addEventListener("click", () => selectTrack(state.selectedTrack - 1));
+  $("trk-next").addEventListener("click", () => selectTrack(state.selectedTrack + 1));
+  $("trk-mute").addEventListener("click", () => toggleFlag(state.selectedTrack, "mute"));
+  $("trk-solo").addEventListener("click", () => toggleFlag(state.selectedTrack, "solo"));
+}
+
+function toggleFlag(track, flag) {
+  commit(() => {
+    const row = state.pattern[track];
+    state.pattern = state.pattern.map((r, i) => (i === track ? { ...row, [flag]: !row[flag] } : r));
+  });
+  updateRow(track);
+  renderTrackBar();
+}
+
+function previewStep(track, step) {
+  const c = state.pattern[track].steps[step];
+  if (c.on && arm()) studio.triggerSource(state.pattern[track].source, c, studio.ctx.currentTime, c.vel);
+}
+
+function paintStep(track, step) {
+  const cell = state.pattern[track].steps[step];
+  if (state.selectedTrack !== track) selectTrack(track);
+  commit(() => {
+    state.pattern = toggleStep(state.pattern, track, step, {
+      note: state.paintNote,
+      chordId: state.paintChord,
+      vel: cell.vel,
+      forceOn: cell.on ? null : true,
+    });
+  });
+  updateCell(track, step);
+  previewStep(track, step);
+}
+
+function cycleVelAt(track, step) {
+  if (state.selectedTrack !== track) selectTrack(track);
+  commit(() => { state.pattern = cycleStepVelocity(state.pattern, track, step); });
+  updateCell(track, step);
+  previewStep(track, step);
+}
+
+function cancelHold() {
+  if (holdTimer) clearTimeout(holdTimer);
+  holdTimer = 0;
+  holdStart = null;
+}
+
+// One set of delegated listeners for the whole grid (no per-button closures).
+function initSeqEvents() {
+  const root = $("seq");
+  const target = (e) => e.target.closest?.("button[data-t]");
+  root.addEventListener("pointerdown", (e) => {
+    const btn = target(e);
+    if (!btn || btn.dataset.s == null || e.button !== 0) return;
+    cancelHold();
+    const t = Number(btn.dataset.t);
+    const s = Number(btn.dataset.s);
+    holdStart = { x: e.clientX, y: e.clientY };
+    // A hold cycles velocity and must not also toggle the step on release,
+    // and the touch long-press "contextmenu" that may follow must not cycle again.
+    holdTimer = window.setTimeout(() => {
+      holdTimer = 0;
+      suppressStepClickUntil = performance.now() + 700;
+      cycleVelAt(t, s);
+    }, 420);
+  });
+  root.addEventListener("pointermove", (e) => {
+    if (holdStart && Math.hypot(e.clientX - holdStart.x, e.clientY - holdStart.y) > 12) cancelHold();
+  });
+  for (const type of ["pointerup", "pointercancel", "pointerleave"]) root.addEventListener(type, cancelHold);
+  root.addEventListener("click", (e) => {
+    const btn = target(e);
+    if (!btn) return;
+    const t = Number(btn.dataset.t);
+    const act = btn.dataset.act;
+    if (act === "mute" || act === "solo") return toggleFlag(t, act);
+    if (act === "sel") return selectTrack(t);
+    if (performance.now() < suppressStepClickUntil || swipeConsumed) return;
+    const s = Number(btn.dataset.s);
+    if (e.shiftKey) return cycleVelAt(t, s);
+    paintStep(t, s);
+  });
+  root.addEventListener("contextmenu", (e) => {
+    const btn = target(e);
+    if (!btn || btn.dataset.s == null) return;
+    e.preventDefault();
+    if (performance.now() < suppressStepClickUntil) return;
+    cycleVelAt(Number(btn.dataset.t), Number(btn.dataset.s));
+  });
+  // Focus view: swipe left/right across the steps to change track.
+  let touch = null;
+  const wrap = $("seq-wrap");
+  wrap.addEventListener("touchstart", (e) => {
+    swipeConsumed = false;
+    touch = e.touches.length === 1 ? { x: e.touches[0].clientX, y: e.touches[0].clientY } : null;
+  }, { passive: true });
+  wrap.addEventListener("touchend", (e) => {
+    if (!touch || !isFocusView()) return;
+    const p = e.changedTouches[0];
+    const dx = p.clientX - touch.x;
+    const dy = p.clientY - touch.y;
+    touch = null;
+    if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.5) {
+      swipeConsumed = true;
+      cancelHold();
+      selectTrack(state.selectedTrack + (dx < 0 ? 1 : -1));
+      window.setTimeout(() => { swipeConsumed = false; }, 350);
+    }
+  }, { passive: true });
+}
+let swipeConsumed = false;
 
 // Step buttons grouped by column, rebuilt only when the grid is re-rendered,
 // so the playhead never has to query the DOM while the sequencer runs.
@@ -1264,6 +1565,10 @@ function bind() {
       studio.allOff();
       return;
     }
+    if (key === "[" || key === "]") {
+      selectTrack(state.selectedTrack + (key === "]" ? 1 : -1));
+      return;
+    }
     if ((key === "z" || key === "arrowleft") && !e.repeat) {
       state.octave = Math.max(1, state.octave - 1);
       renderKeyboard();
@@ -1306,6 +1611,8 @@ renderKeyboard();
 renderDrums();
 renderSoundBanks();
 renderPresets();
+initTrackBar();
+initSeqEvents();
 renderPaint();
 renderSeq();
 bind();
@@ -1317,5 +1624,13 @@ initScopeWatchers();
 window.addEventListener("pagehide", saveNow);
 document.addEventListener("visibilitychange", () => { if (document.hidden && autosaveTimer) saveNow(); });
 window.addEventListener("hashchange", () => { void loadShareFromHash(); });
+$("export").addEventListener("click", () => { void exportWav(); });
+$("ai-form").addEventListener("submit", (e) => { void writeBeat(e); });
+// Offline support (PWA). Skipped on file:// and when service workers are unavailable.
+if ("serviceWorker" in navigator && location.protocol !== "file:") {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("./sw.js").catch(() => { /* offline mode just isn't available */ });
+  });
+}
 void loadShareFromHash();
-$("toast").textContent = "Your beat autosaves in this browser. SHARE makes a link that opens this exact beat. Keys: A–' synth (W E T Y U O P are the black keys), 1–8 drums, Space play/stop, Ctrl/Cmd+Z undo, Shift+Ctrl/Cmd+Z redo.";
+$("toast").textContent = "Your beat autosaves in this browser and the app works offline once loaded. SHARE makes a link that opens this exact beat; EXPORT WAV renders a clean file. Keys: A–' synth (W E T Y U O P are the black keys), 1–8 drums, Space play/stop, Ctrl/Cmd+Z undo, Shift+Ctrl/Cmd+Z redo.";

@@ -22,6 +22,14 @@ NOCTURNE brings the synth keyboard, trap drum pad, genre banks and 12-track step
 - **Undo / redo:** use the UNDO and REDO buttons or Ctrl/Cmd+Z and Shift+Ctrl/Cmd+Z, up to about 100 steps. CLEAR, RANDOMIZE, DUP, presets and loads also show an **UNDO** toast. Undo covers the beat (steps, sources, mute/solo, BPM, swing, length, limiter). It does not change the synth patch or metronome
 - **Share:** SHARE copies a link, or opens the share sheet on phones, that holds the whole beat in its URL. The beat is compressed and nothing is uploaded. Opening the link loads the beat, and you can undo that load. Malformed links are rejected
 
+### Export, AI beats and offline
+- **EXPORT WAV:** renders 1, 2, 4 or 8 bars offline as a clean 48 kHz stereo WAV, 16-bit (dithered) or 24-bit. It goes through the same limiter and speaker-safety chain as playback. Reverb and 808 tails are included, and the metronome is never in it. On iPhone it opens the share sheet (Save to Files, AirDrop and so on). Elsewhere it downloads. Live **REC** still works as before
+- **Describe a beat:** type something like "dark Memphis trap, 140" and **Amienigma AI** writes a pattern. The reply is checked by the same strict validator as share links and loads as one undoable step. Your sound settings and metronome are kept. Requests are rate-limited (one at a time, 15 s apart, 6 per 10 minutes). If the AI can't be reached, everything else keeps working
+- **Works offline / installable:** add it to your home screen. A service worker caches the app and the self-hosted fonts, so after the first visit it loads with no connection. Only the AI beat writer needs the network
+
+### On a phone
+Screens under 600 px show one track at a time as big pads, four per row (16 steps = 4×4). Swipe left or right, or use ◀ ▶ or the track menu, to switch tracks. Mute, solo, the track's sound and its note or chord picker sit above the pads. Desktop keeps the full 12-track grid. Press `[` and `]` to change the selected track.
+
 ### Metronome and tempo
 - **Metronome** with its own volume and an accent on beat 1, scheduled on the audio clock so it stays in time. It plays through the speakers only and is **never recorded**
 - **Count-in:** with the metronome on, REC counts one bar before recording and playback start together on the downbeat. Press REC again to cancel the count-in
@@ -54,9 +62,9 @@ Then visit `http://localhost:4173`. Tap or click once to start audio — phones,
 npm test
 ```
 
-`npm test` covers the music engine plus share-link roundtrips, input sanitizing, the undo stack, tap tempo and recording-format selection.
+`npm test` covers the music engine, share-link roundtrips, input sanitizing, the undo stack, tap tempo, recording-format selection, the WAV encoder (header, length, sample values), the export schedule, AI reply extraction and validation, the AI rate limiter, and the service worker's file list.
 
-It needs no API key and works offline apart from Google Fonts.
+It needs no API key. Fonts are self-hosted (SIL OFL, see `fonts/`), so it works fully offline. The optional AI beat writer calls `https://amienigma-llm.vercel.app/api/chat`.
 
 ## Credit
 
