@@ -283,7 +283,17 @@ export const SOURCE_GROUPS = [
       label: `${h.symbol} (${h.bank})`,
     })),
   },
+  // Appended last: share links store the index into this flattened list.
+  {
+    label: "Your samples",
+    items: Array.from({ length: 8 }, (_, i) => ({ id: `smp:${i + 1}`, label: `Sample ${i + 1}` })),
+  },
 ];
+
+export function sampleSlotFromSource(source) {
+  const m = /^smp:([1-8])$/.exec(String(source));
+  return m ? Number(m[1]) : 0;
+}
 
 export function sourceIsPit(source) {
   return typeof source === "string" && source.startsWith("pit:");

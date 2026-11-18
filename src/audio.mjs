@@ -7,8 +7,10 @@ import {
   sourceIsN808,
   sourceIsChord,
   pitWaveFromSource,
+  sampleSlotFromSource,
 } from "./music.mjs";
 import { pickRecordType, extensionForType } from "./state-io.mjs";
+import { makeBuffer } from "./samples.mjs";
 
 function distortionCurve(amount) {
   const n = 256;
@@ -140,6 +142,8 @@ export class Studio {
     this.route = null; // strip the voice being triggered right now goes to
     this.glide = null; // { fromHz, sec } while triggering a slid step
     this.trackHz = new Map();
+    this.sampleRecs = new Map(); // slot (1-8) -> { name, rate, pcm }
+    this.samples = new Map(); // slot -> AudioBuffer for this.ctx (built on first use)
     this.limiterOn = true;
     this.masterGain = 0.85;
     this.patch = { ...DEFAULT_PATCH };
@@ -263,7 +267,7 @@ export class Studio {
     this.mild = distortionCurve(1.5);
     this.heavy = distortionCurve(3.4);
 
-    for (const name of ["808", "Drums", "Memphis", "Coldwave", "House", "DSBM", "Vocals", "Ambience"]) {
+    for (const name of ["808", "Drums", "Memphis", "Coldwave", "House", "DSBM", "Vocals", "Ambience", "Samples"]) {
       const g = ctx.createGain();
       g.gain.value = 0.85;
       g.connect(this.master);
@@ -1544,7 +1548,61 @@ export class Studio {
       for (const n of hit.notes ?? []) this.firePit(n, t, vel, wave, hold);
       return;
     }
+    const slot = sampleSlotFromSource(source);
+    if (slot) {
+      this.playSample(slot, t, vel, gate);
+      return;
+    }
     this.playNamed(source, t, vel);
+  }
+
+  /** Install (or remove with null) a user sample record { name, rate, pcm: Int16Array }. */
+  setSample(slot, rec) {
+    this.samples.delete(slot);
+    if (rec) this.sampleRecs.set(slot, rec);
+    else this.sampleRecs.delete(slot);
+  }
+
+  sampleBuffer(slot) {
+    let buf = this.samples.get(slot);
+    if (!buf) {
+      const rec = this.sampleRecs.get(slot);
+      if (!rec || !this.ctx) return null;
+      buf = makeBuffer(this.ctx, rec);
+      this.samples.set(slot, buf);
+    }
+    return buf;
+  }
+
+  // One-shot sample voice. Samples are stored normalised to -6 dBFS; a new
+  // hit on the same slot chokes the last one (mono, like an MPC pad), so
+  // rolls never stack up.
+  playSample(slot, when, velocity = 0.9, gate = 0) {
+    if (!this.arm()) return;
+    const buf = this.sampleBuffer(slot);
+    if (!buf) return;
+    const C = this.ctx;
+    const src = C.createBufferSource();
+    src.buffer = buf;
+    const g = C.createGain();
+    const vel = Math.min(1, Math.max(0.05, velocity));
+    g.gain.setValueAtTime(vel, when);
+    const chk = C.createGain();
+    src.connect(g);
+    g.connect(chk);
+    chk.connect(this.busFor("Samples"));
+    const dur = gate > 0 ? Math.min(gate, buf.duration) : buf.duration;
+    if (dur < buf.duration) {
+      g.gain.setValueAtTime(vel, when + Math.max(0, dur - 0.01));
+      g.gain.linearRampToValueAtTime(0, when + dur);
+    }
+    src.start(when);
+    src.stop(when + dur + 0.02);
+    src.addEventListener("ended", () => {
+      try { g.disconnect(); } catch { /* gone */ }
+      try { chk.disconnect(); } catch { /* gone */ }
+    });
+    this.choke(`smp:${slot}`, when, chk, (t) => { try { src.stop(t); } catch { /* done */ } });
   }
 
   playNamed(name, when, velocity = 0.9) {
