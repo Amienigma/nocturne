@@ -58,7 +58,8 @@ import {
   fromStored,
 } from "./src/state-io.mjs";
 import { layerHits, sanitizeLayers } from "./src/sequencer.mjs";
-import { classicBanks, classicMixer, classicState, CLASSIC_BPM, CLASSIC_SWING, CLASSIC_LENGTH, CLASSIC_CHAIN, CLASSIC_SECTIONS } from "./src/classics.mjs";
+import { defaultLoopers, sanitizeLoopers, looperStep, looperHits, activeLoopers, applyLooperQueue, SECTION_LENS, SECTION_LEN_LABELS } from "./src/loopers.mjs";
+import { classicBanks, classicMixer, classicState, isLegacyStarter, CLASSIC_BPM, CLASSIC_SWING, CLASSIC_LENGTH, CLASSIC_CHAIN, CLASSIC_SECTIONS } from "./src/classics.mjs";
 import { SAMPLE_SLOTS, MAX_FILE_BYTES, MAX_SAMPLE_SEC, prepareSample, loadSamples, saveSample, deleteSample } from "./src/samples.mjs";
 import { midiSupported, connectMidi, drumTrackForNote } from "./src/midi.mjs";
 import { renderWav, EXPORT_BARS } from "./src/export.mjs";
@@ -146,7 +147,8 @@ function applyState(raw, { keepMetronome = false, keepPatch = false } = {}) {
   state.chain = s.chain;
   state.song = s.song;
   state.mixer = s.mixer;
-  queuedBank = null;
+  looperQueue.clear();
+  for (const l of loopers) l.on = false;
   queuedMode = null;
   if (!keepMetronome) state.metronome = s.metronome;
   studio.setPatch(state.patch);
@@ -255,18 +257,29 @@ function saveNow() {
   autosaveTimer = 0;
   try {
     // Optional extras next to the packed beat (older builds ignore them):
-    // TAPE on/off and each layer's loop window.
-    const extra = { tape: state.tape, layers: layers.map(({ start, end }) => ({ start, end })) };
+    // TAPE on/off, each layer's loop window and each section looper's length.
+    const extra = { tape: state.tape, layers: layers.map(({ start, end }) => ({ start, end })), secLens: loopers.map((l) => l.len) };
     store()?.setItem(AUTOSAVE_KEY, JSON.stringify({ ...toStored(state), ...extra }));
   } catch { /* storage full or blocked: keep playing */ }
 }
 
+let legacyReplaced = false;
 function loadAutosave() {
   const raw = store()?.getItem(AUTOSAVE_KEY);
   if (!raw) return false;
   const ok = applyState(raw);
+  // The old build opened on the ATLANTA NIGHT preset. A save that is still
+  // exactly that untouched starter (nothing edited) isn't the user's beat, so
+  // the trap sections replace it instead of PLAY bringing the old preset back.
+  if (ok && isLegacyStarter(state)) {
+    applyState(classicState(), { keepMetronome: true, keepPatch: true });
+    legacyReplaced = true;
+    saveNow();
+    return false;
+  }
   const extra = ok ? safeParse(raw) : null;
   if (extra && typeof extra === "object") {
+    if (Array.isArray(extra.secLens)) loopers = sanitizeLoopers(extra.secLens, PATTERN_BANKS);
     if (Array.isArray(extra.layers)) layers = sanitizeLayers(extra.layers.map((l) => ({ ...l, mode: "play" })), TRACKS.length);
     state.tape = extra.tape === true;
     studio.setTape(state.tape);
@@ -455,6 +468,7 @@ async function exportWav() {
       masterGain: Number($("vol").value),
       tape: state.tape,
       layers: exportLayers(),
+      loopers: exportLoopers(),
       onProgress: (p) => { prog.value = p; status.textContent = `Rendering… ${Math.round(p * 100)}%`; },
     });
     window.__lastExport = res; // for tests/debugging
@@ -1254,7 +1268,10 @@ let nextTime = 0;
 let stepIndex = 0;
 let absStep = 0; // steps since PLAY, for bar-accurate metronome accents
 let songPos = 0; // index into state.chain while the song plays
-let queuedBank = null; // section picked while playing; starts at the next bar
+// Section loopers: one per section (A–D), each with its own PLAY / STOP and
+// loop length. Several can play at once, layered on the one clock.
+let loopers = defaultLoopers(PATTERN_BANKS);
+const looperQueue = new Map(); // bank -> { on, len? }: applied at the next bar line
 let queuedMode = null; // "song" | "loop": mode switch waiting for the next bar
 const BAR_STEPS = 16;
 // Last few section switches ({ step, bank, song, why }), for tests/debugging.
@@ -1263,7 +1280,7 @@ function logSwitch(bank, why) {
   transportLog.push({ step: absStep, bank, song: state.song, why });
   if (transportLog.length > 64) transportLog.shift();
 }
-window.__nocturneTransport = () => ({ layers: layers.map((l) => ({ ...l })), layerQueue: [...layerQueue.keys()], syncQueued, playing: state.playing, absStep, stepIndex, songPos, queuedBank, queuedMode, bank: state.bank, song: state.song, log: transportLog.slice() });
+window.__nocturneTransport = () => ({ layers: layers.map((l) => ({ ...l })), layerQueue: [...layerQueue.keys()], syncQueued, playing: state.playing, absStep, stepIndex, songPos, loopers: loopers.map((l) => ({ ...l })), looperQueue: [...looperQueue].map(([bank, op]) => ({ bank, ...op })), queuedMode, bank: state.bank, song: state.song, log: transportLog.slice() });
 const lightTimers = new Set();
 
 function outputDelay() {
@@ -1309,9 +1326,13 @@ function scheduler() {
       const bar = absStep % BAR_STEPS === 0;
       // Section / mode changes land on the next bar line (every 16 steps), so
       // everything stays in time; the new section starts from its step 1.
-      if (bar && (queuedBank != null || queuedMode)) {
+      if (bar && (looperQueue.size || queuedMode)) {
         applyQueued(nextTime);
         stepIndex = 0;
+        if (!state.song && !activeLoopers(loopers).length) {
+          setPlaying(false);
+          return;
+        }
       } else if (stepIndex === 0 && state.song) {
         advanceSong(nextTime);
       }
@@ -1321,11 +1342,16 @@ function scheduler() {
         applyLayerQueue(nextTime);
       }
       if (bar && deckOpen()) queueUi(nextTime, renderCounters);
+      if (bar && !state.song) queueUi(nextTime, renderLooperLive);
     }
-    const step = stepIndex % state.length;
-    const swing = step % 2 === 1 ? (state.swing / 100) * stepSec * 0.5 : 0;
+    // Song: the chain's current section. Otherwise every playing section looper,
+    // layered; the grid's playhead follows the section you're editing.
+    const sel = loopers[state.bank];
+    const step = state.song ? stepIndex % state.length : sel?.on ? looperStep(sel, absStep, state.length) : -1;
+    const swing = absStep % 2 === 1 ? (state.swing / 100) * stepSec * 0.5 : 0;
     const when = nextTime + swing;
-    for (const h of layerHits(state.pattern, layers, absStep, step, stepSec)) {
+    const hits = state.song ? layerHits(state.pattern, layers, absStep, step, stepSec) : looperHits(state.banks, loopers, layers, absStep, stepSec, state.length);
+    for (const h of hits) {
       studio.triggerSource(h.source, h.cell, when + h.at, h.vel, h.opts);
     }
     queueLight(step, when);
@@ -1345,7 +1371,8 @@ function scheduler() {
 function setPlaying(on, startAt = null) {
   if (on && !arm()) return;
   state.playing = on;
-  $("play").textContent = on ? "STOP" : "PLAY";
+  // The top-bar button only stops: sound starts from a section's own ▶ PLAY (or SONG).
+  $("play").disabled = !on;
   $("play").classList.toggle("on", on);
   if (timer) {
     clearInterval(timer);
@@ -1363,9 +1390,17 @@ function setPlaying(on, startAt = null) {
     for (const [t, q] of layerQueue) applyLayerOp(t, q, 0);
     layerQueue.clear();
     syncQueued = false;
-    if (state.song && state.chain.length) switchBank(state.chain[0]);
-    else if (queuedBank != null) switchBank(queuedBank);
-    queuedBank = null;
+    if (state.song && state.chain.length) {
+      for (const l of loopers) l.on = false;
+      switchBank(state.chain[0]);
+    } else {
+      state.song = false;
+      for (const [b, op] of looperQueue) if (op.on !== false && loopers[b]) loopers[b].on = true;
+      // Started by REC's count-in, Space or the tape deck: the section you're on.
+      if (!activeLoopers(loopers).length) loopers[state.bank].on = true;
+      for (const l of loopers) l.origin = 0;
+    }
+    looperQueue.clear();
     queuedMode = null;
     renderBanks();
     timer = window.setInterval(scheduler, 25);
@@ -1374,7 +1409,8 @@ function setPlaying(on, startAt = null) {
     // Just move the playhead off; no need to rebuild the whole grid.
     clearLights();
     state.currentStep = -1;
-    queuedBank = null;
+    looperQueue.clear();
+    for (const l of loopers) l.on = false;
     queuedMode = null;
     renderBanks();
     renderDeck();
@@ -1445,7 +1481,7 @@ function initInspector() {
 }
 
 // ---- Sections (pattern banks A–D), solo loops and the song chain ----
-// Each section can loop on its own (▶ LOOP) or the chain plays them in order
+// Each section has its own looper (▶ PLAY; several can layer) or the chain plays them in order
 // (▶ SONG). While playing, any switch (section → section, loop ↔ song) is
 // queued to the next bar line so the groove never drops a beat.
 let bankClipboard = null;
@@ -1475,19 +1511,26 @@ function setAudioBank(next, when) {
 
 // Called by the scheduler on a bar line with something queued.
 function applyQueued(when) {
-  let next = state.bank;
   if (queuedMode === "song") {
     state.song = true;
     songPos = 0;
-    if (state.chain.length) next = state.chain[0];
+    for (const l of loopers) l.on = false;
+    looperQueue.clear();
+    queuedMode = null;
+    const next = state.chain.length ? state.chain[0] : state.bank;
+    logSwitch(next, "bar");
+    setAudioBank(next, when);
   } else {
-    if (queuedMode === "loop") state.song = false;
-    if (queuedBank != null) next = queuedBank;
+    if (queuedMode === "loop") {
+      state.song = false;
+      for (const l of loopers) l.on = false;
+    }
+    queuedMode = null;
+    const changes = [...looperQueue];
+    applyLooperQueue(loopers, looperQueue, absStep);
+    for (const [b, op] of changes) logSwitch(b, op.on === false ? "looper-off" : "looper");
+    queueUi(when, renderBanks);
   }
-  queuedBank = null;
-  queuedMode = null;
-  logSwitch(next, "bar");
-  setAudioBank(next, when);
   scheduleAutosave();
 }
 
@@ -1499,33 +1542,53 @@ function advanceSong(when) {
   setAudioBank(state.chain[songPos], when);
 }
 
-/** ▶ LOOP on a section: start it looping, queue it while playing, or stop it. */
-function loopSection(b) {
+/**
+ * A section's own ▶ PLAY. Stopped: start just that section's looper.
+ * Playing: a stopped section joins in sync at the next bar (layered on top),
+ * a playing one stops right away (the last one stops the beat), and a section
+ * that's waiting for the bar line is cancelled by a second tap.
+ */
+function sectionPlay(b) {
   if (b < 0 || b >= PATTERN_BANKS) return;
-  if (state.playing) {
-    const loopingThis = !state.song && state.bank === b;
-    if (loopingThis && queuedBank == null && !queuedMode) {
+  if (!state.playing) {
+    cancelCountIn();
+    if (state.song) commit(() => { state.song = false; });
+    looperQueue.clear();
+    for (const l of loopers) l.on = false;
+    loopers[b].on = true;
+    switchBank(b);
+    setPlaying(true);
+    return;
+  }
+  if (state.song) {
+    if (looperQueue.has(b)) looperQueue.delete(b);
+    else looperQueue.set(b, { on: true });
+    queuedMode = looperQueue.size ? "loop" : null;
+    renderBanks();
+    return;
+  }
+  if (loopers[b].on) {
+    loopers[b].on = false;
+    looperQueue.delete(b);
+    logSwitch(b, "looper-off");
+    if (!activeLoopers(loopers).length) {
       setPlaying(false);
       return;
     }
-    queuePick(b);
-    return;
+  } else if (looperQueue.has(b)) {
+    looperQueue.delete(b);
+  } else {
+    looperQueue.set(b, { on: true });
   }
-  cancelCountIn();
-  if (state.song) commit(() => { state.song = false; });
-  switchBank(b);
-  setPlaying(true);
+  renderBanks();
 }
 
-// While playing: loop section `b` from the next bar (leaving the song if needed).
-function queuePick(b) {
-  if (state.song) {
-    queuedMode = "loop";
-    queuedBank = b;
-  } else {
-    queuedMode = null;
-    queuedBank = b === state.bank ? null : b;
-  }
+/** A section looper's length (½, 1 or 2 bars). A playing looper restarts with it at the next bar. */
+function setLooperLen(b, len) {
+  if (!SECTION_LENS.includes(len) || !loopers[b]) return;
+  if (state.playing && !state.song && loopers[b].on) looperQueue.set(b, { on: true, len });
+  else loopers[b].len = len;
+  scheduleAutosave();
   renderBanks();
 }
 
@@ -1546,21 +1609,22 @@ function songButton() {
   } else if (state.song) {
     if (queuedMode === "loop") {
       queuedMode = null;
-      queuedBank = null;
+      looperQueue.clear();
     } else {
       setPlaying(false);
       return;
     }
   } else {
     queuedMode = "song";
-    queuedBank = null;
+    looperQueue.clear();
   }
   renderBanks();
 }
 
+/** The section letter only picks which section you edit; sound comes from ▶ PLAY. */
 function pickBank(b) {
-  if (state.playing) {
-    queuePick(b);
+  if (state.playing && state.song) {
+    showSnack("The song is playing: it moves through the chain. Tap ▶ PLAY on a section to loop it instead");
     return;
   }
   switchBank(b);
@@ -1594,31 +1658,35 @@ function sectionLabel(b) {
 
 function renderBanks() {
   const playing = state.playing;
-  const playBank = state.bank;
   document.querySelectorAll("[data-pbank]").forEach((el) => {
     const b = Number(el.dataset.pbank);
     el.classList.toggle("on", b === state.bank);
-    el.classList.toggle("queued", b === queuedBank);
     el.setAttribute("aria-pressed", String(b === state.bank));
   });
+  const songPlaying = playing && state.song;
   document.querySelectorAll("[data-loop]").forEach((el) => {
     const b = Number(el.dataset.loop);
-    const looping = playing && !state.song && b === playBank;
-    const queued = b === queuedBank;
-    el.classList.toggle("on", looping);
+    const l = loopers[b];
+    const on = playing && !state.song && l.on;
+    const q = looperQueue.get(b);
+    const queued = Boolean(q) && !on;
+    const N = BANK_NAMES[b];
+    el.classList.toggle("on", on);
     el.classList.toggle("queued", queued);
-    el.setAttribute("aria-pressed", String(looping));
-    el.textContent = looping ? "■ STOP" : queued ? "◷ NEXT BAR" : "▶ LOOP";
-    el.setAttribute("aria-label", looping ? `Stop looping section ${BANK_NAMES[b]}` : `Loop section ${BANK_NAMES[b]}${playing ? " from the next bar" : ""}`);
+    el.setAttribute("aria-pressed", String(on));
+    el.textContent = on ? "■ STOP" : queued ? "◷ NEXT BAR" : "▶ PLAY";
+    el.setAttribute("aria-label", on ? `Stop section ${N}` : queued ? `Section ${N} starts at the next bar; tap to cancel` : `Play section ${N}${playing ? " in sync from the next bar" : ""}`);
     const card = el.closest(".sec");
-    if (card) {
-      card.classList.toggle("playing", playing && b === playBank);
-      const name = card.querySelector(".sec-name");
-      if (name) name.textContent = sectionLabel(b);
-    }
+    if (!card) return;
+    card.classList.toggle("playing", on || (songPlaying && b === state.bank));
+    card.classList.toggle("editing", b === state.bank);
+    const name = card.querySelector(".sec-name");
+    if (name) name.textContent = sectionLabel(b);
+    const len = card.querySelector("[data-seclen]");
+    if (len) len.value = String(q?.len ?? l.len);
   });
+  renderLooperLive();
   const songBtn = $("song");
-  const songPlaying = playing && state.song;
   songBtn.classList.toggle("on", state.song);
   songBtn.classList.toggle("queued", queuedMode === "song");
   songBtn.setAttribute("aria-pressed", String(state.song));
@@ -1648,10 +1716,12 @@ function renderBanks() {
   $("chain-del").disabled = state.chain.length === 0;
   $("chain-clear").disabled = state.chain.length === 0;
   let status = "";
+  const act = activeLoopers(loopers).map((b) => BANK_NAMES[b]);
+  const joining = [...looperQueue].filter(([b, op]) => op.on !== false && !loopers[b].on).map(([b]) => BANK_NAMES[b]);
   if (queuedMode === "song") status = "Song starts at the next bar";
-  else if (queuedBank != null) status = `Section ${BANK_NAMES[queuedBank]} loops from the next bar`;
+  else if (queuedMode === "loop") status = `Section ${joining.join(" + ")} loops from the next bar`;
   else if (songPlaying) status = `Song: part ${pos + 1} of ${state.chain.length} (loops)`;
-  else if (playing) status = `Looping section ${BANK_NAMES[playBank]}`;
+  else if (playing) status = `Playing section ${act.join(" + ")}${act.length > 1 ? " (layered, in sync)" : ""}${joining.length ? `; ${joining.join(" + ")} joins at the next bar` : ""}`;
   else if (state.song) status = `Song: ${state.chain.length} part${state.chain.length === 1 ? "" : "s"}`;
   $("bank-status").textContent = status;
   const bars = $("exp-bars");
@@ -1659,6 +1729,30 @@ function renderBanks() {
     bars.disabled = state.song;
     bars.title = state.song ? "Song mode exports the whole chain once" : "";
   }
+}
+
+// Live indicator on each section card: which bar of its loop it's on. Updated
+// once per bar (scheduler) and on changes; no animation loop.
+function renderLooperLive() {
+  const playing = state.playing;
+  document.querySelectorAll(".sec .sec-live").forEach((el) => {
+    const b = Number(el.dataset.live);
+    const l = loopers[b];
+    const on = playing && !state.song && l.on;
+    let text = "stopped";
+    if (on) {
+      const len = Math.min(l.len, state.length);
+      text = len < 16 ? "● ½-bar loop" : `● bar ${Math.floor(looperStep(l, Math.max(0, absStep - 1), state.length) / 16) + 1}/${len / 16}`;
+    } else if (looperQueue.has(b)) text = "◷ joining";
+    else if (playing && state.song && b === state.bank) text = "● in song";
+    el.textContent = text;
+  });
+}
+
+/** What EXPORT WAV renders outside song mode: the playing section loopers (else the section you're on). */
+function exportLoopers() {
+  if (state.song || !state.playing || !activeLoopers(loopers).length) return null;
+  return loopers.map((l) => ({ ...l, origin: 0 }));
 }
 
 function setChain(next) {
@@ -1677,7 +1771,10 @@ function initBanks() {
     el.addEventListener("click", () => pickBank(Number(el.dataset.pbank)));
   });
   document.querySelectorAll("[data-loop]").forEach((el) => {
-    el.addEventListener("click", () => loopSection(Number(el.dataset.loop)));
+    el.addEventListener("click", () => sectionPlay(Number(el.dataset.loop)));
+  });
+  document.querySelectorAll("[data-seclen]").forEach((el) => {
+    el.addEventListener("change", () => setLooperLen(Number(el.dataset.seclen), Number(el.value)));
   });
   $("bank-copy").addEventListener("click", () => {
     bankClipboard = JSON.parse(JSON.stringify(state.pattern));
@@ -2495,9 +2592,11 @@ function bind() {
   $("vol").addEventListener("input", () => {
     if (studio.armed) studio.setMasterGain(Number($("vol").value));
   });
+  // STOP ALL: stops every section looper (and the song). Starting sound is
+  // always a section's own ▶ PLAY, SONG, or the tape deck.
   $("play").addEventListener("click", () => {
     cancelCountIn();
-    setPlaying(!state.playing);
+    if (state.playing) setPlaying(false);
   });
   $("limiter").addEventListener("click", () => {
     commit(() => { state.limiter = !state.limiter; });
@@ -2587,9 +2686,11 @@ function bind() {
     }
     if (e.metaKey || e.ctrlKey || e.altKey) return;
     if (key === " ") {
+      // Space = the selected section's own ▶ PLAY; while playing it stops everything.
       e.preventDefault();
       cancelCountIn();
-      setPlaying(!state.playing);
+      if (state.playing) setPlaying(false);
+      else sectionPlay(state.bank);
       return;
     }
     if (key === "escape") {
@@ -2676,6 +2777,8 @@ if ("serviceWorker" in navigator && location.protocol !== "file:") {
 }
 void loadShareFromHash();
 if (!restored && !fromLink) {
-  showSnack("A classic 808 trap beat is loaded: press PLAY (or ▶ LOOP on A). B–D are rage, dark and fill; ▶ SONG plays A A B A C D");
+  showSnack(legacyReplaced
+    ? "The old ATLANTA NIGHT starter (never edited) was replaced by trap sections A–D. Tap ▶ PLAY on any section; tap another to layer it in"
+    : "Four 808 trap sections are loaded: tap ▶ PLAY on A (or any section). Tap another ▶ PLAY to layer it in at the next bar; ▶ SONG plays A A B A C D");
 }
-$("toast").textContent = "Your beat autosaves in this browser and the app works offline once loaded. SHARE makes a link that opens this exact beat; EXPORT WAV renders a clean file. Keys: A–' synth (W E T Y U O P are the black keys), 1–8 drums, Space play/stop, Ctrl/Cmd+Z undo, Shift+Ctrl/Cmd+Z redo.";
+$("toast").textContent = "Your beat autosaves in this browser and the app works offline once loaded. SHARE makes a link that opens this exact beat; EXPORT WAV renders a clean file. Keys: A–' synth (W E T Y U O P are the black keys), 1–8 drums, Space plays the selected section / stops all, Ctrl/Cmd+Z undo, Shift+Ctrl/Cmd+Z redo.";

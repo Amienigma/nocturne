@@ -103,7 +103,7 @@ test("e2e: iPhone layout, banks + song, step features, mixer, keyboard grid, sha
     await page.keyboard.press("Enter");
     assert.equal(await page.$eval('.seq-row[data-t="0"] .step[data-s="1"]', (e) => e.getAttribute("aria-pressed")), "true");
     await page.keyboard.press(" ");
-    assert.equal(await page.$eval("#play", (e) => e.textContent), "PLAY");
+    assert.equal(await page.evaluate(() => window.__nocturneState.playing), false, "Space on a step toggles it, doesn't start playback");
     assert.equal(await page.$eval('.seq-row[data-t="0"] .step[data-s="1"]', (e) => e.getAttribute("aria-pressed")), "false");
 
     // Share link v2 round trip in a fresh tab keeps bank B, chain, mixer and the roll.

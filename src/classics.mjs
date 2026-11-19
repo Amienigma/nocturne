@@ -2,7 +2,7 @@
 // share link) loads these four original, trap-style 2-bar grooves so every
 // section plays a real 808 the moment you press play. Saved beats are never
 // touched; LOAD CLASSIC 808 brings them back on demand (undoable).
-import { TRACKS, emptyPattern } from "./music.mjs";
+import { TRACKS, emptyPattern, applyPreset } from "./music.mjs";
 import { defaultMix, defaultMetronome, withPatternAlias, STATE_VERSION } from "./state-io.mjs";
 import { DEFAULT_PATCH } from "./music.mjs";
 
@@ -196,4 +196,18 @@ export function classicState() {
     song: false,
     mixer: classicMixer(),
   });
+}
+
+// The previous build opened every fresh session on the ATLANTA NIGHT preset in
+// section A (B–D empty), and autosaved it. A save that still holds exactly that
+// untouched starter isn't the user's own beat; the app swaps in the trap
+// sections for it so PLAY never brings the old preset back.
+const sig = (p) => JSON.stringify(p.map((row) => [row.source, row.steps.map((c, j) => (c.on ? `${j}:${c.note}:${c.chordId}:${c.rat}` : "")).filter(Boolean).join(",")]));
+let legacySig = null;
+export function isLegacyStarter(state) {
+  const banks = state?.banks;
+  if (!Array.isArray(banks) || banks.length < 1) return false;
+  if (banks.slice(1).some((p) => p.some((row) => row.steps.some((c) => c.on)))) return false;
+  legacySig ??= sig(applyPreset("ATLANTA NIGHT"));
+  return sig(banks[0]) === legacySig;
 }

@@ -68,36 +68,96 @@ test("e2e: classic 808 sections, solo loops, bar-line queueing, song chain", { s
     assert.equal(await page.evaluate(() => window.__nocturneState.length), 32);
     assert.equal(fresh.saved, null, "defaults alone don't write an autosave");
     assert.equal(fresh.overflow, 0);
-    assert.deepEqual(fresh.loopLabels, ["Loop section A", "Loop section B", "Loop section C", "Loop section D"]);
+    assert.deepEqual(fresh.loopLabels, ["Play section A", "Play section B", "Play section C", "Play section D"]);
+    // The top-bar button only stops: it can't start (or play a preset) on its own.
+    assert.deepEqual(await page.$eval("#play", (e) => [e.textContent, e.disabled]), ["■ STOP ALL", true]);
+    assert.deepEqual(await page.$$eval(".sec-live", (e) => e.map((x) => x.textContent)), ["stopped", "stopped", "stopped", "stopped"]);
+    await click("#play");
+    assert.equal((await tr()).playing, false, "STOP ALL never starts anything");
 
-    // 2. Solo-loop each section: it plays on its own, keeps looping (no switches), and stops on a 2nd tap.
+    // Record which section (bank) and row step every voice comes from.
+    await page.evaluate(() => {
+      const st = window.__nocturne808;
+      window.__hits = [];
+      const orig = st.triggerSource.bind(st);
+      st.triggerSource = (src, cell, when, vel, opts) => {
+        const tk = opts?.track;
+        if (tk != null) {
+          const banks = window.__nocturneState.banks;
+          const bank = banks.findIndex((p) => p[tk].steps.includes(cell));
+          window.__hits.push({ t: tk, bank, step: bank >= 0 ? banks[bank][tk].steps.indexOf(cell) : -1, abs: window.__nocturneTransport().absStep });
+        }
+        return orig(src, cell, when, vel, opts);
+      };
+    });
+    const hitsNow = () => page.evaluate(() => window.__hits);
+    const clearHits = () => page.evaluate(() => { window.__hits.length = 0; });
+    const banksHeard = async (from = -1) => [...new Set((await hitsNow()).filter((h) => h.abs > from).map((h) => h.bank))].sort();
+
+    // 2. Each section's own ▶ PLAY plays only that section, keeps looping, and stops on a 2nd tap.
     for (const b of [0, 1, 2, 3]) {
+      await clearHits();
       await click(`[data-loop="${b}"]`);
-      await waitFor((bb) => { const t = window.__nocturneTransport(); return t.playing && t.bank === bb && t.absStep > 20; }, b);
+      await waitFor((bb) => { const t = window.__nocturneTransport(); return t.playing && t.absStep > 20; }, b);
       const t = await tr();
       assert.equal(t.song, false);
+      assert.equal(t.bank, b, "the section you play is the one you see");
+      assert.deepEqual(t.loopers.map((l) => l.on), [0, 1, 2, 3].map((x) => x === b));
       assert.deepEqual(t.log, [], `section ${b} loops without switching`);
+      assert.deepEqual(await banksHeard(), [b], `only section ${"ABCD"[b]} is heard (no preset, no other section)`);
       assert.equal(await page.$eval(`[data-loop="${b}"]`, (e) => e.getAttribute("aria-pressed")), "true");
-      assert.match(await page.$eval("#bank-status", (e) => e.textContent), new RegExp(`Looping section ${"ABCD"[b]}`));
+      assert.equal(await page.$eval(`[data-loop="${b}"]`, (e) => e.textContent), "■ STOP");
+      assert.equal(await page.$eval("#play", (e) => e.disabled), false, "STOP ALL is live while playing");
+      assert.match(await page.$eval(`[data-live="${b}"]`, (e) => e.textContent), /● bar [12]\/2/);
+      assert.match(await page.$eval("#bank-status", (e) => e.textContent), new RegExp(`Playing section ${"ABCD"[b]}`));
       await click(`[data-loop="${b}"]`);
       assert.equal((await tr()).playing, false);
     }
+    // Space (nothing focused) = the selected section's own ▶ PLAY: section D (selected last), only D.
+    await page.evaluate(() => document.activeElement?.blur());
+    await clearHits();
+    await page.keyboard.press(" ");
+    await waitFor(() => window.__nocturneTransport().absStep > 12);
+    assert.deepEqual((await tr()).loopers.map((l) => l.on), [false, false, false, true]);
+    assert.deepEqual(await banksHeard(), [3]);
+    await page.keyboard.press(" ");
+    assert.equal((await tr()).playing, false);
 
-    // 3. Bar-line queueing: while A loops, tap C mid-bar -> C starts exactly on the next bar.
+    // 3. Layering: while A plays, tap C mid-bar -> C joins exactly at the next bar, A keeps going.
     await click('[data-loop="0"]');
     await waitFor(() => { const t = window.__nocturneTransport(); return t.playing && t.absStep % 16 >= 3 && t.absStep % 16 <= 9; });
     await click('[data-loop="2"]');
     let t = await tr();
-    assert.equal(t.queuedBank, 2);
-    assert.equal(t.bank, 0, "still playing A until the bar line");
+    assert.deepEqual(t.looperQueue, [{ bank: 2, on: true }]);
+    assert.deepEqual(t.loopers.map((l) => l.on), [true, false, false, false], "C waits for the bar line");
     assert.match(await page.$eval('[data-loop="2"]', (e) => e.textContent), /NEXT BAR/);
-    await waitFor(() => window.__nocturneTransport().log.length >= 1);
+    await waitFor(() => window.__nocturneTransport().log.some((x) => x.why === "looper"));
     t = await tr();
-    assert.equal(t.log[0].bank, 2);
-    assert.equal(t.log[0].step % 16, 0, `switched on a bar line (step ${t.log[0].step})`);
+    const join = t.log.find((x) => x.why === "looper");
+    assert.equal(join.bank, 2);
+    assert.equal(join.step % 16, 0, `joined on a bar line (step ${join.step})`);
+    assert.equal(t.loopers[2].origin, join.step, "C starts from its step 1 at that bar");
+    assert.deepEqual(t.loopers.map((l) => l.on), [true, false, true, false]);
+    await waitFor((n) => window.__nocturneTransport().absStep > n + 20, join.step, 20000);
+    assert.deepEqual(await banksHeard(join.step), [0, 2], "A + C layered, B and D silent");
+    assert.match(await page.$eval("#bank-status", (e) => e.textContent), /Playing section A \+ C \(layered, in sync\)/);
+    // Tapping a playing section stops just that one, right away.
+    await click('[data-loop="0"]');
+    t = await tr();
     assert.equal(t.playing, true);
+    assert.deepEqual(t.loopers.map((l) => l.on), [false, false, true, false]);
+    // A ½-bar loop length on C restarts it at the next bar.
+    await page.select('[data-seclen="2"]', "8");
+    await waitFor(() => window.__nocturneTransport().loopers[2].len === 8);
+    t = await tr();
+    assert.equal(t.loopers[2].origin % 16, 0);
+    await clearHits();
+    await waitFor((n) => window.__nocturneTransport().absStep > n + 24, t.absStep, 20000);
+    const cSteps = (await hitsNow()).filter((h) => h.bank === 2 && h.abs > t.loopers[2].origin).map((h) => h.step);
+    assert.ok(cSteps.length > 4 && cSteps.every((x) => x < 8), `C loops its first ½ bar: ${cSteps}`);
+    await page.select('[data-seclen="2"]', "32");
 
-    // 4. Loop -> song without stopping: ▶ SONG queues the chain for the next bar, then A A B A C D in order.
+    // 4. Loopers -> song without stopping: ▶ SONG queues the chain for the next bar, then A A B A C D in order.
     await click("#song");
     assert.equal((await tr()).queuedMode, "song");
     const parts = () => window.__nocturneTransport().log.filter((x) => x.song && (x.why === "bar" || x.why === "song"));
@@ -109,21 +169,24 @@ test("e2e: classic 808 sections, solo loops, bar-line queueing, song chain", { s
     assert.equal(songLog[0].why, "bar");
     for (let i = 2; i < 6; i++) assert.equal(songLog[i].step - songLog[i - 1].step, 32, "one 2-bar section per part");
     assert.equal(t.playing, true, "transport never stopped");
-    // ...and it loops back to the top.
+    assert.ok(t.loopers.every((l) => !l.on), "song replaces the loopers");
     await waitFor(`(${parts})().length >= 7`, null, 20000);
     assert.equal((await tr()).log.filter((x) => x.song && x.why === "song")[5].bank, 0);
 
-    // 5. Song -> one section, still without stopping: tap ▶ LOOP on B.
+    // 5. Song -> one section's looper, still without stopping: tap ▶ PLAY on B.
+    const songAt = (await tr()).absStep;
     await click('[data-loop="1"]');
     assert.equal((await tr()).queuedMode, "loop");
-    const before = (await tr()).log.length;
-    await waitFor((n) => window.__nocturneTransport().log.length > n && !window.__nocturneTransport().song, before);
+    await waitFor((n) => window.__nocturneTransport().log.some((x) => x.why === "looper" && !x.song && x.step > n), songAt);
     t = await tr();
-    const last = t.log[t.log.length - 1];
+    const last = t.log.filter((x) => x.why === "looper" && x.step > songAt).pop();
     assert.deepEqual([last.bank, last.song, last.step % 16], [1, false, 0]);
+    assert.deepEqual(t.loopers.map((l) => l.on), [false, true, false, false]);
     assert.equal(t.playing, true);
-    await click('[data-loop="1"]'); // stop
+    // STOP ALL stops everything.
+    await click("#play");
     assert.equal((await tr()).playing, false);
+    assert.equal(await page.$eval("#play", (e) => e.disabled), true);
 
     // 6. Chain building: CLEAR, tap +D +A, ⌫ removes the last part.
     await click("#chain-clear");
@@ -138,17 +201,9 @@ test("e2e: classic 808 sections, solo loops, bar-line queueing, song chain", { s
     await page.$eval("#deck-panel", (d) => { d.open = true; });
     assert.equal(await page.$$eval("#deck .deck", (r) => r.length), 12);
     assert.equal(await page.$$eval("#deck .deck.rolling", (r) => r.length), 0, "reels still while stopped");
-    // Record which row step every voice comes from.
-    await page.evaluate(() => {
-      const st = window.__nocturne808;
-      window.__hits = [];
-      const orig = st.triggerSource.bind(st);
-      st.triggerSource = (src, cell, when, vel, opts) => {
-        const tk = opts?.track;
-        if (tk != null) window.__hits.push({ t: tk, step: window.__nocturneState.pattern[tk].steps.indexOf(cell), abs: window.__nocturneTransport().absStep });
-        return orig(src, cell, when, vel, opts);
-      };
-    });
+    await click('[data-pbank="0"]'); // edit section A (selecting doesn't play anything)
+    assert.equal((await tr()).playing, false);
+    await clearHits();
     // CHat: ½-bar window, then ⟲ LOOP (starts the transport from stopped).
     await page.select('[data-layer="3"] select', "8");
     await click('[data-layer="3"] [data-la="loop"]');
@@ -248,6 +303,22 @@ test("e2e: classic 808 sections, solo loops, bar-line queueing, song chain", { s
     assert.equal(await page.$eval("#bpm-num", (e) => e.value), "145");
     await click("#undo");
     assert.equal(await page.evaluate(() => window.__nocturneState.bpm), 93);
+
+    // 8b. An old autosave that is still the untouched ATLANTA NIGHT starter (the
+    // previous build's default) is replaced by the trap sections, so no ▶ PLAY can bring it back.
+    await page.evaluate(async () => {
+      const io = await import("./src/state-io.mjs");
+      const { applyPreset } = await import("./src/music.mjs");
+      const s = io.defaultState();
+      s.banks[0] = applyPreset("ATLANTA NIGHT");
+      localStorage.setItem("nocturne.autosave.v1", JSON.stringify(io.toStored(s)));
+      Storage.prototype.setItem = () => {};
+    });
+    await page.reload({ waitUntil: "networkidle0" });
+    const migrated = await page.evaluate(() => ({ bpm: window.__nocturneState.bpm, names: [...document.querySelectorAll(".sec-name")].map((e) => e.textContent), snack: document.getElementById("snack")?.textContent || "" }));
+    assert.equal(migrated.bpm, 145);
+    assert.deepEqual(migrated.names, ["TRAP", "RAGE", "DARK", "FILL"]);
+    assert.match(migrated.snack, /ATLANTA NIGHT starter/);
 
     // 9. Idle: nothing runs once stopped (no rAF loop, no scheduler, context suspends).
     const idle = await page.evaluate(async () => {
