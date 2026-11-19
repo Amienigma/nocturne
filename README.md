@@ -17,8 +17,9 @@ NOCTURNE brings the synth keyboard, trap drum pad, genre banks and 12-track step
 - Shared master gain plus a limiter/compressor, speaker protection, a CRT look, and **REC**. The recording format is whatever the browser supports: `.m4a` on Safari/iPhone, otherwise `.webm` or `.ogg`
 
 ### Banks, song mode and trap steps
-- **Pattern banks A–D:** four patterns per beat. Bank buttons switch instantly when stopped. While playing, the new bank starts at the next loop. COPY / PASTE copies a bank (paste is undoable)
-- **Song mode:** build a chain of up to 16 banks (+ adds the current bank, − removes the last, tap a chip to change it). With SONG on, playback walks the chain and loops it. EXPORT WAV then renders the whole chain once
+- **Classic 808 sections:** a fresh session (nothing autosaved, no share link) opens with four original, classic-style TR-808 grooves at 128 BPM so every section plays a real 808 straight away: **A ELECTRO** (Planet-Rock-era electro: long 808 boom, snare + clap on 2 and 4, accented 16th hats, cowbell), **B TRAP** (half-time snare/clap, 1/32 and 1/64 hat rolls, sliding 808 bass), **C MIAMI** (Miami bass: dotted 808 boom + sub notes, cowbell hook, maracas) and **D BREAK** (clave breakdown into a high-mid-low tom fill and snare roll). They use a new circuit-modelled **TR-808 kit** (bass drum, snare, clap, closed/open hats with choke, cowbell, tuned toms, rimshot, clave, maracas), available on any track as "TR-808 classic" sounds. Saved beats are never replaced; **LOAD CLASSIC 808** brings the four sections back at any time (undoable)
+- **Sections A–D, solo loops:** each section has its own **▶ LOOP** button that plays just that section on repeat (tap again to stop). Tap another section's ▶ LOOP (or its letter) while playing and it takes over **at the next bar line**, so it stays in time; the button shows ◷ NEXT BAR until then. Tap a letter when stopped to edit that section. COPY / PASTE copies a section (paste is undoable)
+- **Song mode (bring it together):** the chain (default A A B B C D, up to 16 parts) plays the sections in order and loops. Build it with **+A +B +C +D**, **⌫** removes the last part, **CLEAR** empties it, tapping a chip changes that part. **▶ SONG** starts the song, or, while a section is looping, switches to the song at the next bar; ▶ LOOP on any section leaves the song at the next bar. The transport never stops. EXPORT WAV in song mode renders the whole chain once
 - **Step settings** (tap a step, then use the step bar under the grid):
   - **Roll:** 1/2, 1/3, 1/4 or 1/6 ratchets inside one step. Later hits are slightly softer
   - **Chance:** 100, 75, 50 or 25%, rolled each time the step comes round
@@ -92,7 +93,7 @@ npm test
 npm run test:e2e
 ```
 
-This runs a browser end-to-end test with `puppeteer-core` against a local server. It checks iPhone layout, banks and song mode, step settings, the mixer, keyboard grid navigation, and v1 + v2 share links. It needs Chrome or Chromium; set `CHROME_PATH` if it isn't in a standard place. Without a browser it skips.
+This runs a browser end-to-end test with `puppeteer-core` against a local server. It checks iPhone layout, the classic 808 sections (defaults only on an empty session, solo-looping each section, bar-line queueing, song chain order, loop ↔ song without stopping), banks and song mode, step settings, the mixer, keyboard grid navigation, and v1 + v2 share links. It needs Chrome or Chromium; set `CHROME_PATH` if it isn't in a standard place. Without a browser it skips.
 
 It needs no API key. Fonts are self-hosted (SIL OFL, see `fonts/`), so it works fully offline. The optional AI beat writer calls `https://amienigma-llm.vercel.app/api/chat`.
 

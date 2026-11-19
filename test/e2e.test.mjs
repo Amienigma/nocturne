@@ -64,9 +64,11 @@ test("e2e: iPhone layout, banks + song, step features, mixer, keyboard grid, sha
     const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
     assert.equal(overflow, 0, "no horizontal scroll at 390 px");
 
-    // Bank B: starts empty, a step tap lands in B only.
+    // Section B: starts with the classic trap groove; CLEAR it, then a step tap lands in B only.
     await $('[data-pbank="1"]');
     assert.equal(await page.$eval('[data-pbank="1"]', (e) => e.getAttribute("aria-pressed")), "true");
+    assert.ok(await page.$$eval(".seq-row .step.on", (e) => e.length) > 10, "classic trap pattern loaded");
+    await $("#clear");
     assert.equal(await page.$$eval(".seq-row .step.on", (e) => e.length), 0);
     await page.$eval('.seq-row.sel .step[data-s="0"]', (e) => e.click());
     assert.equal(await page.$eval('.seq-row.sel .step[data-s="0"]', (e) => e.getAttribute("aria-pressed")), "true");
@@ -79,11 +81,12 @@ test("e2e: iPhone layout, banks + song, step features, mixer, keyboard grid, sha
     assert.ok(cell.prob);
     assert.match(cell.label, /velocity \d+%, roll ×3, 50% chance/);
 
-    // Song chain A → B, then play: it runs without errors.
-    await $("#chain-add");
-    await $("#song");
+    // Song chain rebuilt as A → B, then ▶ SONG plays it: it runs without errors.
+    await $("#chain-clear");
+    await $('[data-append="0"]');
+    await $('[data-append="1"]');
     assert.deepEqual(await page.$$eval("#chain .mini", (e) => e.map((x) => x.textContent)), ["A", "B"]);
-    await $("#play");
+    await $("#song");
     await new Promise((r) => setTimeout(r, 1500));
     await $("#play");
 
@@ -110,7 +113,7 @@ test("e2e: iPhone layout, banks + song, step features, mixer, keyboard grid, sha
     await p2.goto(`${base}#s=${code}`, { waitUntil: "networkidle0" });
     await new Promise((r) => setTimeout(r, 300));
     const loaded = await p2.evaluate(() => ({ bank: window.__nocturneState.bank, chain: window.__nocturneState.chain, song: window.__nocturneState.song,
-      pan: window.__nocturneState.mixer[0].pan, rat: window.__nocturneState.banks[1][6].steps[0].rat }));
+      pan: window.__nocturneState.mixer[0].pan, rat: window.__nocturneState.banks[1][0].steps[0].rat }));
     // (PLAY in song mode moved the edit bank to the chain's first part, A.)
     assert.deepEqual(loaded, { bank: 0, chain: [0, 1], song: true, pan: -0.5, rat: 3 });
 

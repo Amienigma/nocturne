@@ -236,6 +236,20 @@ export const DEFAULT_NOTES = {
   Vocal: 50,
 };
 
+// Classic TR-808 voice set (synthesised in audio.mjs, Studio.play808).
+export const TR808_VOICES = [
+  { id: "BD", label: "808 Bass Drum" },
+  { id: "SD", label: "808 Snare" },
+  { id: "CP", label: "808 Hand Clap" },
+  { id: "CH", label: "808 Closed Hat" },
+  { id: "OH", label: "808 Open Hat" },
+  { id: "CB", label: "808 Cowbell" },
+  { id: "TOM", label: "808 Toms (tuned by note)" },
+  { id: "RS", label: "808 Rimshot" },
+  { id: "CL", label: "808 Clave" },
+  { id: "MA", label: "808 Maracas" },
+];
+
 export const SOURCE_GROUPS = [
   {
     label: "808 PIT",
@@ -288,6 +302,12 @@ export const SOURCE_GROUPS = [
     label: "Your samples",
     items: Array.from({ length: 8 }, (_, i) => ({ id: `smp:${i + 1}`, label: `Sample ${i + 1}` })),
   },
+  // Appended after samples (share links index this list): circuit-modelled
+  // TR-808 voices used by the classic default sections.
+  {
+    label: "TR-808 classic",
+    items: TR808_VOICES.map((v) => ({ id: `tr:${v.id}`, label: v.label })),
+  },
 ];
 
 export function sampleSlotFromSource(source) {
@@ -307,8 +327,12 @@ export function sourceIsChord(source) {
   return typeof source === "string" && source.startsWith("chord:");
 }
 
+export function sourceIsTr808(source) {
+  return typeof source === "string" && source.startsWith("tr:");
+}
+
 export function sourceIsMelodic(source) {
-  return sourceIsPit(source) || sourceIsN808(source) || sourceIsChord(source);
+  return sourceIsPit(source) || sourceIsN808(source) || sourceIsChord(source) || source === "tr:TOM";
 }
 
 export function pitWaveFromSource(source) {
