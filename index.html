@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>NOCTURNE × 808 PIT — Browser Beat Lab</title>
   <meta name="description" content="NOCTURNE sequencing plus 808 PIT sound design: Atlanta 808 subs, Memphis chords, filter, envelope, waveform and a 12-track step sequencer. All sounds synthesized with Web Audio.">
-  <meta name="theme-color" content="#060608">
+  <meta name="theme-color" content="#07050b">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -14,18 +14,29 @@
   <link rel="icon" type="image/png" sizes="32x32" href="./icons/favicon-32.png">
   <link rel="apple-touch-icon" href="./icons/apple-touch-icon.png">
   <link rel="preload" href="./fonts/jetbrains-mono-latin.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="./fonts/saira-xc-800-latin.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="./fonts/fonts.css">
   <style>
     :root {
-      --bg: #060608;
-      --panel: #101014;
-      --card: #13131a;
-      --border: #23232e;
-      --fg: #ececf1;
-      --muted: #8b8b99;
-      --cyan: #7df9ff;
-      --orange: #ff6b35;
-      --pit: #e25c4a;
+      /* Southern night 2077: candy paint over near-black. --cyan is the "live"
+         colour (lean purple), --orange the "on / armed" colour (grill gold),
+         --pit the candy-red accent. Names kept so every rule picks them up. */
+      --bg: #07050b;
+      --panel: #120c1a;
+      --card: #160f21;
+      --border: #2e2342;
+      --fg: #f3eefa;
+      --muted: #ab9cc2;
+      --cyan: #c792ff;
+      --orange: #f6c445;
+      --pit: #ff3b6b;
+      --gold-hi: #fff1b8;
+      --gold-lo: #a87912;
+      --chrome: linear-gradient(180deg, #ffffff 0%, #d9d7e4 30%, #8f8aa3 50%, #f2f0f8 58%, #b4afc6 78%, #ece9f5 100%);
+      --chrome-rim: linear-gradient(180deg, #f4f2fb, #8c87a0 45%, #3c3650 55%, #c9c5d8);
+      --grill: linear-gradient(180deg, var(--gold-hi) 0%, #f6c445 42%, #d39b1c 58%, #ffe08a 100%);
+      --candy: linear-gradient(180deg, #f3e0ff 0%, #cf9cff 40%, #b072f5 60%, #dcb6ff 100%);
+      --display: "Saira Extra Condensed", "Space Grotesk", "Arial Narrow", sans-serif;
       --safe-top: env(safe-area-inset-top, 0px);
       --safe-bottom: env(safe-area-inset-bottom, 0px);
     }
@@ -260,13 +271,194 @@
     #toast { color: var(--muted); font-size: 11px; }
     .armed-banner { display: none; background: #141018; border: 1px solid var(--border); color: var(--muted); padding: 8px 12px; border-radius: 10px; font-size: 11px; }
     body.waiting .armed-banner { display: block; }
+
+    /* ================= THEME: Southern trap, 2077 =========================
+       Everything below is static paint: gradients, borders and fixed glows.
+       No backdrop-filter, no filters, no animated shadows; the only motion is
+       the tape reels while their layer rolls (transform only) and existing
+       transitions. Touch targets are at least 44 px. */
+    html, body { background-color: var(--bg); }
+    body {
+      background-image:
+        radial-gradient(900px 420px at 12% -6%, rgba(155, 77, 255, .22), transparent 70%),
+        radial-gradient(700px 380px at 100% 0%, rgba(255, 59, 107, .12), transparent 70%),
+        linear-gradient(180deg, #0b0712 0%, var(--bg) 40%);
+      background-repeat: no-repeat;
+    }
+    .grotesk, h2, .lcd h3 { font-family: var(--display); font-weight: 800; }
+    h2 { font-size: 20px; letter-spacing: .1em; text-transform: uppercase; color: var(--fg); }
+    h2 span { color: var(--orange); font-size: 10px; letter-spacing: .12em; }
+    /* Header: lacquer bar with a gold pinstripe and static scanlines. */
+    header {
+      background:
+        repeating-linear-gradient(0deg, rgba(255, 255, 255, .025) 0 1px, transparent 1px 3px),
+        linear-gradient(180deg, #1a1026 0%, #0c0813 100%);
+      border-bottom: 1px solid #3a2b52;
+      box-shadow: 0 1px 0 rgba(246, 196, 69, .35);
+    }
+    .brand h1.wordmark { font-size: 30px; line-height: .95; letter-spacing: .03em; text-transform: uppercase; }
+    .wm {
+      background: var(--chrome); -webkit-background-clip: text; background-clip: text;
+      color: transparent; -webkit-text-fill-color: transparent;
+      -webkit-text-stroke: .5px rgba(255, 255, 255, .25);
+    }
+    .wm-x { font-size: 16px; letter-spacing: .14em; color: var(--orange); -webkit-text-fill-color: var(--orange); vertical-align: middle; }
+    @supports not ((background-clip: text) or (-webkit-background-clip: text)) { .wm { color: #e9e6f2; -webkit-text-fill-color: #e9e6f2; } }
+    .brand p { color: var(--muted); font-size: 9px; letter-spacing: .18em; }
+    .pill { background: linear-gradient(180deg, #1b1327, #110b19); border-color: #3a2c52; box-shadow: inset 0 1px 0 rgba(255, 255, 255, .06); }
+    .pill label { color: var(--muted); letter-spacing: .14em; }
+    input[type=range] { accent-color: var(--orange); }
+    progress { accent-color: var(--orange); }
+    /* Chrome-rimmed buttons; ON = gold grill. */
+    .btn, .mini, .chip {
+      min-height: 44px;
+      border: 1px solid transparent;
+      background: linear-gradient(180deg, #221931, #140d1e) padding-box, var(--chrome-rim) border-box;
+      color: var(--fg);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .1);
+    }
+    .mini { min-width: 44px; padding: 4px 12px; font-size: 11px; }
+    .chip { padding: 6px 12px; font-size: 11px; }
+    .btn.on, .mini.on, .chip.on, .tab.on, .wave.on, .pad.on {
+      background: var(--grill) padding-box, linear-gradient(180deg, #fff6cf, var(--gold-lo)) border-box;
+      color: #1d1404; border-color: transparent;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .6), inset 0 -2px 0 rgba(120, 80, 0, .35);
+    }
+    .btn.pit.on { background: linear-gradient(180deg, #ff8aa6, var(--pit) 50%, #c2184a) padding-box, var(--chrome-rim) border-box; color: #1a0208; }
+    .pad.on small { color: #3b2a06; }
+    .btn:disabled, .mini:disabled { opacity: .45; }
+    .mini.queued, .btn.queued { background: linear-gradient(180deg, #221931, #140d1e) padding-box, var(--grill) border-box; color: var(--orange); }
+    :focus-visible { outline: 2px solid var(--orange); outline-offset: 2px; }
+    .step:focus-visible { outline: 2px solid #fff; outline-offset: 1px; }
+    /* Panels: smoked glass look without blur; faint perspective grid behind the first one. */
+    main { position: relative; isolation: isolate; overflow-x: clip; }
+    main::before {
+      content: ""; position: absolute; left: 0; right: 0; top: 0; height: 360px; z-index: -1; pointer-events: none;
+      background:
+        repeating-linear-gradient(90deg, rgba(199, 146, 255, .16) 0 1px, transparent 1px 48px),
+        repeating-linear-gradient(0deg, rgba(199, 146, 255, .16) 0 1px, transparent 1px 48px);
+      transform: perspective(420px) rotateX(58deg) scale(1.6);
+      transform-origin: 50% 0;
+      -webkit-mask-image: linear-gradient(180deg, transparent, #000 25%, transparent 95%);
+      mask-image: linear-gradient(180deg, transparent, #000 25%, transparent 95%);
+      opacity: .55;
+    }
+    section.panel, details.panel {
+      background: linear-gradient(180deg, rgba(26, 17, 38, .96), rgba(12, 8, 19, .98));
+      border: 1px solid #2f2445;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .05), 0 0 0 1px rgba(155, 77, 255, .06);
+    }
+    .lcd { background: linear-gradient(180deg, #120a1d, #0a0612); border-color: #3a2b52; box-shadow: inset 0 0 40px rgba(155, 77, 255, .14); }
+    .lcd h3 { color: #f8e6ff; letter-spacing: .06em; font-size: 32px; }
+    .lcd p { color: #b9a6d6; }
+    #scope, canvas.mini { background: #0d0815; border-color: #3a2b52; }
+    .wave, .tab, .pad, .key, .step, .src, .trk, .ms {
+      border-color: #33264a; background-color: #170f22;
+    }
+    .key { background: linear-gradient(180deg, #f3eefa, #c9c2d8); color: #1a1226; border-color: #6c6184; }
+    .key.black { background: linear-gradient(180deg, #2a2038, #0d0915); color: #cbbfe0; border-color: #4a3d63; }
+    .key.on { background: var(--candy); color: #160a24; border-color: #e5ccff; }
+    .seq-row.sel { background: rgba(155, 77, 255, .08); }
+    .seq-row.sel .trk { border-color: var(--pit); color: #ffd3de; }
+    .step { color: #8f80a6; }
+    .step.on { background: var(--cyan); border-color: #e5ccff; color: #14081f; }
+    @supports (background: color-mix(in srgb, red 50%, blue)) {
+      .step.on { background: color-mix(in srgb, var(--cyan) calc(var(--vel, 1) * 100%), #170f22); }
+    }
+    .step.on::after { background: #14081f; }
+    .step.beat { box-shadow: inset 0 0 0 1px #4a3a66; }
+    .step.now { outline: 2px solid var(--orange); outline-offset: -2px; }
+    .step.sel-step { box-shadow: 0 0 0 2px var(--pit); }
+    .ms.on { background: var(--cyan); color: #14081f; }
+    .chain .mini.now { background: var(--candy) padding-box, var(--chrome-rim) border-box; color: #160a24; }
+    #snack { background: linear-gradient(180deg, #24183a, #160f22); border-color: #4a3d63; }
+    footer a, .hint a { color: #dcb6ff; }
+    /* Section loopers = illuminated hardware pads. */
+    .sec {
+      background:
+        radial-gradient(120% 90% at 50% 0%, rgba(155, 77, 255, .12), transparent 60%),
+        linear-gradient(180deg, #1b1228, #0f0a17);
+      border: 1px solid #3a2c52; border-radius: 14px;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .07), inset 0 -2px 0 rgba(0, 0, 0, .5);
+    }
+    .sec.editing { border-color: #8a7aa6; }
+    .sec.playing {
+      border-color: var(--cyan);
+      background:
+        radial-gradient(120% 100% at 50% 100%, rgba(199, 146, 255, .32), transparent 65%),
+        linear-gradient(180deg, #24163a, #130b20);
+      box-shadow: 0 0 0 1px var(--cyan), 0 0 22px rgba(199, 146, 255, .35), inset 0 1px 0 rgba(255, 255, 255, .12);
+    }
+    .sec .pbank {
+      min-height: 44px; min-width: 52px; padding: 0 10px;
+      font-family: var(--display); font-weight: 800; font-size: 28px; line-height: 1; letter-spacing: 0;
+    }
+    .sec .pbank:not(.on) { color: #ece9f5; }
+    .sec-name { font-family: var(--display); font-weight: 600; font-size: 14px; letter-spacing: .16em; color: #cdbfe3; }
+    .sec .sec-loop {
+      min-height: 60px; border-radius: 12px; border: 2px solid transparent;
+      font-family: var(--display); font-weight: 800; font-size: 24px; letter-spacing: .12em;
+      background: linear-gradient(180deg, #2a1d3d, #150d21) padding-box, var(--chrome-rim) border-box;
+      color: #f3eefa;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .14), inset 0 -3px 0 rgba(0, 0, 0, .45);
+    }
+    .sec .sec-loop.on {
+      background: var(--candy) padding-box, linear-gradient(180deg, #ffffff, #8c63c9) border-box;
+      color: #14081f;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .7), inset 0 -3px 0 rgba(80, 30, 140, .35);
+    }
+    .sec .sec-loop.queued { background: linear-gradient(180deg, #2a1d3d, #150d21) padding-box, var(--grill) border-box; color: var(--orange); }
+    .sec .sec-len { min-height: 44px; background: #0e0916; border-color: #3a2c52; }
+    .sec-live { font-size: 12px; }
+    .sec.playing .sec-live { color: #e2c8ff; }
+    /* Tape deck = chrome cassette deck. */
+    #deck-panel summary { font-family: var(--display); font-weight: 800; font-size: 20px; letter-spacing: .1em; min-height: 44px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .deck {
+      background:
+        repeating-linear-gradient(90deg, rgba(255, 255, 255, .018) 0 1px, transparent 1px 3px),
+        linear-gradient(180deg, #2a2735, #17141f 55%, #1d1a27);
+      border: 1px solid #4b4560; border-radius: 12px;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .12), inset 0 -1px 0 rgba(0, 0, 0, .6);
+      padding: 6px 8px;
+    }
+    .deck b { font-family: var(--display); font-weight: 800; font-size: 16px; letter-spacing: .08em; color: #efeaf7; }
+    .deck .mini { min-width: 44px; padding: 4px 8px; }
+    .deck select, .deck input { min-height: 44px; background: #0e0b14; border-color: #4b4560; }
+    .tcount { background: #120a03; color: var(--orange); border: 1px solid #5a430f; padding: 3px 6px; font-size: 12px; box-shadow: inset 0 0 6px rgba(246, 196, 69, .25); }
+    .reel {
+      width: 26px; height: 26px; border: 3px solid transparent; border-radius: 50%;
+      background:
+        radial-gradient(circle, #0b0910 0 22%, transparent 23%) padding-box,
+        repeating-conic-gradient(#5b5570 0 20deg, #1c1926 20deg 60deg) padding-box,
+        var(--chrome-rim) border-box;
+    }
+    .deck.rolling .reel {
+      border-color: transparent;
+      background:
+        radial-gradient(circle, #0b0910 0 22%, transparent 23%) padding-box,
+        repeating-conic-gradient(#c792ff 0 20deg, #241634 20deg 60deg) padding-box,
+        var(--grill) border-box;
+    }
+    /* 44 px touch targets for every control (the piano keys are a dense musical layout, scrollable sideways). */
+    .btn { min-width: 44px; }
+    .slots input, .slots select, .track-bar select, .insp select, .tools select, .tools input[type=text], .num, #bpm-num { min-height: 44px; }
+    .track-bar .ms, .track-bar .arrow { min-width: 44px; min-height: 44px; }
+    .key { min-width: 44px; }
+    .sec-hint { display: block; }
+    /* Phones: the 44 px controls make the top bar tall, so it scrolls away
+       instead of covering half the screen (each section card has its own STOP). */
+    @media (max-width: 600px) {
+      header { position: relative; }
+      .brand h1.wordmark { font-size: 34px; }
+    }
+    .armed-banner { background: linear-gradient(90deg, rgba(155, 77, 255, .18), rgba(255, 59, 107, .12)); border-color: #4a3d63; color: #e7dcf5; }
   </style>
 </head>
 <body class="waiting">
   <header>
     <div class="brand">
-      <h1 class="grotesk">NOCTURNE × 808 PIT</h1>
-      <p>SEQUENCING BY NOCTURNE · SOUND DESIGN FROM 808 PIT</p>
+      <h1 class="grotesk wordmark"><span class="wm">NOCTURNE</span> <span class="wm-x">× 808 PIT</span></h1>
+      <p>ATL · H-TOWN · 2077 — SEQUENCING BY NOCTURNE · SOUND DESIGN FROM 808 PIT</p>
     </div>
     <div class="scopes">
       <canvas id="mini-wave" class="mini" width="140" height="36"></canvas>
@@ -296,7 +488,7 @@
       <div class="grid-2">
         <div class="lcd">
           <h3 id="lcd-title">Idle</h3>
-          <p id="lcd-sub">Audio stays off until you touch a key, pad, or Play. Sound design from 808 PIT.</p>
+          <p id="lcd-sub">Audio stays off until you touch a key, a pad or a section's ▶ PLAY. Sound design from 808 PIT.</p>
         </div>
         <div>
           <div class="subhead">SCOPE / LEVEL</div>

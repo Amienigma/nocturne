@@ -71,11 +71,15 @@ export const POST_GAIN_LIMITER = 0.9; // after the musical LIMITER (it has auto 
 export const POST_GAIN_DIRECT = 1.28; // LIMITER off: the safety stage does the limiting
 export const SAFETY_HPF_HZ = 28;
 export const SAFETY_CEILING = 0.87; // ~-1.2 dBFS sample peak, leaves room for inter-sample peaks
+// The soft clip tops out a little lower (~-1.6 dBFS) than the hard ceiling, so
+// dense stacks are rounded off smoothly and the flat hard clamp (whose square
+// corners cause inter-sample overs) almost never engages: true peak <= -1.2 dBFS.
+export const SOFT_CEILING = 0.83;
 export const SUB_FLOOR_HZ = 30;
 
 // Soft-clip curve: transparent below `knee`, smooth tanh shoulder above it,
 // and the endpoints (where any input beyond +/-1 lands) never exceed the ceiling.
-function ceilingCurve(ceiling = SAFETY_CEILING, knee = 0.8 * SAFETY_CEILING) {
+function ceilingCurve(ceiling = SOFT_CEILING, knee = 0.8 * SOFT_CEILING) {
   const n = 4097;
   const curve = new Float32Array(n);
   const room = ceiling - knee;

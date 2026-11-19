@@ -82,6 +82,21 @@ Screens under 600 px show one track at a time as big pads, four per row (16 step
 - Waveform visualizer with a level meter
 - Those voices are playable from the keyboard and pads **and** sequenceable: each track has an assignable sound source, and 808 / chord tracks store a note or chord per step
 
+## Look
+
+The theme is southern trap set in 2077: Atlanta and H-Town at night. It uses candy paint and slab colours (lean purple, candy red, grill gold and chrome) over near-black.
+
+- **Wordmark and section letters:** chrome.
+- **Buttons:** chrome rims; anything switched on lights up as a gold grill.
+- **Section cards:** they glow like illuminated hardware pads.
+- **Tape deck:** chrome cassette rows with gold tape counters.
+- **Background:** a static perspective grid and header scanlines.
+- **Fonts:** display type is Saira Extra Condensed, mono is JetBrains Mono. Both are self-hosted under the SIL OFL, with licences in `fonts/`.
+- **Phone heat:** nothing animates at idle. There is no `backdrop-filter`, no animated filters and no shadow animations. The reels spin only while a deck is rolling, and they stop under `prefers-reduced-motion`.
+- **Accessibility:** controls are at least 44 px, and focus shows as a gold outline.
+
+The soft clipper's ceiling (`SOFT_CEILING` 0.83, under the 0.87 hard clamp) keeps the true peak at −1.2 dBFS or lower even with all four sections layered at maximum settings. `test/loopers.test.mjs` checks this.
+
 ## Tracks
 
 Kick, Snare, Clap, CHat, OHat, Perc, **808** (defaults to the 808 PIT sub), Bass, Synth (defaults to PIT horror, so Memphis chords can be painted per step), Atmos, Guitar, Vocal.
