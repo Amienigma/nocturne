@@ -15,6 +15,7 @@ import {
   RATCHETS,
   PROBS,
   GATES,
+  RAMPS,
 } from "./music.mjs";
 
 // v2 adds pattern banks A–D, song chain, per-track mixer and per-step
@@ -93,6 +94,7 @@ function sanitizeCell(raw, base) {
     prob: PROBS.includes(c.prob) ? c.prob : 1,
     slide: c.slide === true,
     gate: GATES.includes(c.gate) ? c.gate : 0,
+    ramp: Number.isInteger(c.ramp) && c.ramp > 0 && c.ramp < RAMPS.length ? c.ramp : 0,
   };
 }
 
@@ -192,7 +194,9 @@ export function bankIsEmpty(pattern) {
 //   [bank mask: which of A-D follow]
 //   per bank: 12 x track: uint16 source index, flags (bit0 mute, bit1 solo),
 //     uint32 on-mask, then per on-step: vel(0-100), note, chord index,
-//     ext (bits0-2 ratchet idx, bit3 slide, bits4-6 gate idx), prob(0-100)
+//     ext (bits0-2 ratchet idx, bit3 slide, bits4-6 gate idx, bit7 ramp byte
+//     follows), prob(0-100) [, ramp idx 1..] - bit7 was always 0 before, so
+//     older v2 links decode unchanged and links without ramps are byte-identical.
 // v1 links ([1]... one pattern, 3 bytes per step) still decode.
 export function packState(state) {
   const s = sanitizeState(state);
@@ -217,8 +221,9 @@ export function packState(state) {
       out.push((mask >>> 24) & 255, (mask >>> 16) & 255, (mask >>> 8) & 255, mask & 255);
       for (const c of row.steps) {
         if (!c.on) continue;
-        const ext = RATCHETS.indexOf(c.rat) | (c.slide ? 8 : 0) | (GATES.indexOf(c.gate) << 4);
+        const ext = RATCHETS.indexOf(c.rat) | (c.slide ? 8 : 0) | (GATES.indexOf(c.gate) << 4) | (c.ramp ? 0x80 : 0);
         out.push(Math.round(c.vel * 100), c.note, Math.max(0, CHORD_IDS.indexOf(c.chordId)), ext, Math.round(c.prob * 100));
+        if (c.ramp) out.push(c.ramp);
       }
     }
   });
@@ -264,8 +269,13 @@ function readPattern(r, v2) {
       const prob = r.u8() / 100;
       const rat = RATCHETS[ext & 7];
       const gate = GATES[(ext >> 4) & 7];
-      if (rat === undefined || gate === undefined || (ext & 0x80) || !PROBS.includes(prob)) throw new Error("ext");
-      return { ...cell, on: true, vel, note, chordId, rat, prob, slide: (ext & 8) === 8, gate };
+      if (rat === undefined || gate === undefined || !PROBS.includes(prob)) throw new Error("ext");
+      let ramp = 0;
+      if (ext & 0x80) {
+        ramp = r.u8();
+        if (ramp < 1 || ramp >= RAMPS.length) throw new Error("ramp");
+      }
+      return { ...cell, on: true, vel, note, chordId, rat, prob, slide: (ext & 8) === 8, gate, ramp };
     });
     return { ...def, source, mute: (flags & 1) === 1, solo: (flags & 2) === 2, steps };
   });

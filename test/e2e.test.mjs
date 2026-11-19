@@ -32,6 +32,19 @@ function serve() {
 // A v1 share link made by the previous release (BLACK ICE, 142 BPM, 32 steps).
 const V1 = "rAY4RIAAFuFFMzR64QkyCA564eoMAEQAAAAAAABYAAAAAEFgmAQAbAAAAAAAAHwEAAAAAACAAAAAAAAAkAAAAAAAAAACAAECBWCQBWCABWCIBKBgBAAoAAAAAAABIAAAAAQFYPAZYPAYAMgAAAAAAADMAAAAREVg0AVg0AVg0AVg0AQA2AAAAAAA";
 
+// 1 s full-scale 100 Hz square wave, 16-bit mono 44.1 kHz.
+function squareWav() {
+  const rate = 44100;
+  const n = rate;
+  const buf = Buffer.alloc(44 + n * 2);
+  buf.write("RIFF", 0); buf.writeUInt32LE(36 + n * 2, 4); buf.write("WAVE", 8);
+  buf.write("fmt ", 12); buf.writeUInt32LE(16, 16); buf.writeUInt16LE(1, 20); buf.writeUInt16LE(1, 22);
+  buf.writeUInt32LE(rate, 24); buf.writeUInt32LE(rate * 2, 28); buf.writeUInt16LE(2, 32); buf.writeUInt16LE(16, 34);
+  buf.write("data", 36); buf.writeUInt32LE(n * 2, 40);
+  for (let i = 0; i < n; i++) buf.writeInt16LE((Math.floor(i / 220.5) % 2 ? -1 : 1) * 32767, 44 + i * 2);
+  return buf;
+}
+
 test("e2e: iPhone layout, banks + song, step features, mixer, keyboard grid, share links", { skip: (!CHROME || !puppeteer) && "Chrome or puppeteer-core not available", timeout: 120000 }, async () => {
   const server = await serve();
   const base = `http://127.0.0.1:${server.address().port}/`;
@@ -51,9 +64,11 @@ test("e2e: iPhone layout, banks + song, step features, mixer, keyboard grid, sha
     const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
     assert.equal(overflow, 0, "no horizontal scroll at 390 px");
 
-    // Bank B: starts empty, a step tap lands in B only.
+    // Section B: starts with the classic trap groove; CLEAR it, then a step tap lands in B only.
     await $('[data-pbank="1"]');
     assert.equal(await page.$eval('[data-pbank="1"]', (e) => e.getAttribute("aria-pressed")), "true");
+    assert.ok(await page.$$eval(".seq-row .step.on", (e) => e.length) > 10, "classic trap pattern loaded");
+    await $("#clear");
     assert.equal(await page.$$eval(".seq-row .step.on", (e) => e.length), 0);
     await page.$eval('.seq-row.sel .step[data-s="0"]', (e) => e.click());
     assert.equal(await page.$eval('.seq-row.sel .step[data-s="0"]', (e) => e.getAttribute("aria-pressed")), "true");
@@ -66,11 +81,12 @@ test("e2e: iPhone layout, banks + song, step features, mixer, keyboard grid, sha
     assert.ok(cell.prob);
     assert.match(cell.label, /velocity \d+%, roll ×3, 50% chance/);
 
-    // Song chain A → B, then play: it runs without errors.
-    await $("#chain-add");
-    await $("#song");
+    // Song chain rebuilt as A → B, then ▶ SONG plays it: it runs without errors.
+    await $("#chain-clear");
+    await $('[data-append="0"]');
+    await $('[data-append="1"]');
     assert.deepEqual(await page.$$eval("#chain .mini", (e) => e.map((x) => x.textContent)), ["A", "B"]);
-    await $("#play");
+    await $("#song");
     await new Promise((r) => setTimeout(r, 1500));
     await $("#play");
 
@@ -87,7 +103,7 @@ test("e2e: iPhone layout, banks + song, step features, mixer, keyboard grid, sha
     await page.keyboard.press("Enter");
     assert.equal(await page.$eval('.seq-row[data-t="0"] .step[data-s="1"]', (e) => e.getAttribute("aria-pressed")), "true");
     await page.keyboard.press(" ");
-    assert.equal(await page.$eval("#play", (e) => e.textContent), "PLAY");
+    assert.equal(await page.evaluate(() => window.__nocturneState.playing), false, "Space on a step toggles it, doesn't start playback");
     assert.equal(await page.$eval('.seq-row[data-t="0"] .step[data-s="1"]', (e) => e.getAttribute("aria-pressed")), "false");
 
     // Share link v2 round trip in a fresh tab keeps bank B, chain, mixer and the roll.
@@ -97,7 +113,7 @@ test("e2e: iPhone layout, banks + song, step features, mixer, keyboard grid, sha
     await p2.goto(`${base}#s=${code}`, { waitUntil: "networkidle0" });
     await new Promise((r) => setTimeout(r, 300));
     const loaded = await p2.evaluate(() => ({ bank: window.__nocturneState.bank, chain: window.__nocturneState.chain, song: window.__nocturneState.song,
-      pan: window.__nocturneState.mixer[0].pan, rat: window.__nocturneState.banks[1][6].steps[0].rat }));
+      pan: window.__nocturneState.mixer[0].pan, rat: window.__nocturneState.banks[1][0].steps[0].rat }));
     // (PLAY in song mode moved the edit bank to the chain's first part, A.)
     assert.deepEqual(loaded, { bank: 0, chain: [0, 1], song: true, pan: -0.5, rat: 3 });
 
@@ -106,6 +122,30 @@ test("e2e: iPhone layout, banks + song, step features, mixer, keyboard grid, sha
     await p2.reload({ waitUntil: "networkidle0" }); // hashchange-free path: load from autosave after import
     const v1 = await p2.evaluate(() => ({ bpm: document.getElementById("bpm-num").value, len: window.__nocturneState.length }));
     assert.ok(["142"].includes(v1.bpm) && v1.len === 32, JSON.stringify(v1));
+
+    // Sampling: import a loud WAV into slot 1, use it as the Kick track's sound,
+    // export: still below -1 dBFS; the sample survives a reload (IndexedDB).
+    const wav = path.join(fs.mkdtempSync("/tmp/noct-e2e-"), "square.wav");
+    fs.writeFileSync(wav, squareWav());
+    await p2.evaluate(() => { localStorage.clear(); });
+    await p2.reload({ waitUntil: "networkidle0" });
+    const [chooser] = await Promise.all([p2.waitForFileChooser(), p2.$eval('.smp[data-slot="1"] [data-sact="load"]', (e) => e.click())]);
+    await chooser.accept([wav]);
+    await p2.waitForFunction(() => /Sample 1: square/.test(document.getElementById("smp-status").textContent), { timeout: 10000 });
+    await p2.evaluate(() => {
+      const pick = document.getElementById("trk-pick"); pick.value = "0"; pick.dispatchEvent(new Event("change"));
+      const src = document.getElementById("trk-src"); src.value = "smp:1"; src.dispatchEvent(new Event("change"));
+      document.getElementById("exp-bars").value = "1";
+      document.getElementById("vol").value = "1";
+    });
+    assert.match(await p2.$eval('#trk-src option[value="smp:1"]', (e) => e.textContent), /1\. square/);
+    await p2.$eval("#export", (e) => e.click());
+    await p2.waitForFunction(() => window.__lastExport && !document.getElementById("export").disabled, { timeout: 60000 });
+    const peak = await p2.evaluate(() => 20 * Math.log10(window.__lastExport.peak));
+    assert.ok(peak < -1 && peak > -30, `sample export peak ${peak}`);
+    await p2.reload({ waitUntil: "networkidle0" });
+    await p2.waitForFunction(() => /square/.test(document.querySelector('.smp[data-slot="1"] small').textContent), { timeout: 5000 });
+    assert.match(await p2.$eval("#midi-status", (e) => e.textContent), /MIDI/);
     assert.deepEqual(errors, []);
   } finally {
     await browser.close();

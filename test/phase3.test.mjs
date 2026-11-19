@@ -45,7 +45,7 @@ test("v1 share links still open, into bank A with default mixer", async () => {
         assert.equal(s.pattern[t].steps[j].on, expected[t].steps[j].on, `${t}/${j}`);
       }
     }
-    assert.deepEqual(s.pattern[6].steps[31], { on: true, vel: 0.4, note: 24, chordId: "cm", rat: 1, prob: 1, slide: false, gate: 0 });
+    assert.deepEqual(s.pattern[6].steps[31], { on: true, vel: 0.4, note: 24, chordId: "cm", rat: 1, prob: 1, slide: false, gate: 0, ramp: 0 });
     assert.equal(s.pattern[3].mute, true);
     assert.equal(s.pattern[7].source, "n808:Sub-Heavy");
     assert.ok(s.banks.slice(1).every((b) => b.every((row) => row.steps.every((c) => !c.on))));
@@ -131,7 +131,7 @@ test("ratchets subdivide a step, probability is per step, slide only on the firs
   let n = 0;
   for (let i = 0; i < 1000; i++) n += stepHits(q, 0, 0.1, rng).length;
   assert.ok(n > 420 && n < 580, String(n));
-  assert.deepEqual(RATCHETS, [1, 2, 3, 4, 6]);
+  assert.deepEqual(RATCHETS.slice(0, 5), [1, 2, 3, 4, 6]); // append-only: share links store indexes
   assert.ok(PROBS.includes(1) && GATES.includes(0));
 });
 

@@ -198,9 +198,52 @@
     .insp input[type=range] { width: 90px; }
     .insp.off label, .insp.off #insp-slide { opacity: .45; }
     .mini.queued { border-color: var(--orange); }
+    .smp-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    @media (min-width: 700px) { .smp-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+    .smp { border: 1px solid var(--border); background: var(--card); border-radius: 10px; padding: 8px; display: grid; gap: 6px; min-width: 0; }
+    .smp .pad { min-height: 52px; width: 100%; min-width: 0; overflow: hidden; }
+    .smp .pad small { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .smp .acts { display: flex; gap: 4px; flex-wrap: wrap; }
+    .smp .acts .mini { padding: 4px 7px; }
+    .smp .mini.rec.on { background: #e5484d; border-color: #e5484d; color: #fff; }
+    .sections { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; margin-top: 10px; }
+    @media (min-width: 700px) { .sections { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+    .sec { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px; align-items: center; border: 1px solid var(--border); background: var(--card); border-radius: 12px; padding: 8px; min-width: 0; }
+    .sec.editing { box-shadow: inset 0 0 0 1px var(--muted); }
+    .sec.playing { border-color: var(--cyan); box-shadow: 0 0 0 1px var(--cyan); }
+    .sec .pbank { min-width: 40px; min-height: 36px; font-size: 16px; font-weight: 700; }
+    .sec .sec-loop { grid-column: 1 / -1; min-height: 56px; font-family: inherit; font-size: 18px; font-weight: 700; letter-spacing: .08em; white-space: nowrap; border-radius: 10px; border: 1px solid var(--border); background: #14141c; color: var(--fg); cursor: pointer; }
+    .sec .sec-loop.on { background: var(--cyan); color: #111; border-color: var(--cyan); }
+    .sec .sec-loop.queued { border-color: var(--orange); color: var(--orange); }
+    .sec .sec-len { background: #0b0b10; color: var(--fg); border: 1px solid var(--border); border-radius: 8px; padding: 4px; font-size: 12px; min-width: 0; }
+    .sec-live { font-size: 11px; color: var(--muted); line-height: 1.2; min-width: 0; }
+    .sec.playing .sec-live { color: var(--cyan); }
+    .sec-hint { margin: 6px 0 0; }
+    .sec-name { color: var(--muted); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #song { font-weight: 700; }
+    #song.on { border-color: var(--cyan); }
+    .chain-add { display: inline-flex; gap: 3px; }
     .chain { display: inline-flex; flex-wrap: wrap; gap: 3px; }
     .chain .mini { padding: 4px 7px; }
     .chain .mini.now { background: var(--cyan); color: #111; }
+    #deck-panel summary { cursor: pointer; font-size: 14px; letter-spacing: .08em; }
+    .deck-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+    .deck-list { display: grid; gap: 4px; margin-top: 8px; }
+    .deck { display: flex; flex-wrap: wrap; gap: 4px 6px; align-items: center; border: 1px solid var(--border); border-radius: 10px; padding: 5px 7px; background: #101016; min-width: 0; }
+    .deck b { font-size: 11px; min-width: 52px; letter-spacing: .06em; }
+    .deck.stopped b { opacity: .5; }
+    .deck .mini { padding: 4px 8px; min-width: 30px; }
+    .deck .mini.on { background: var(--cyan); color: #111; }
+    .deck select, .deck input { background: #0b0b10; color: var(--fg); border: 1px solid var(--border); border-radius: 8px; padding: 3px 4px; font-size: 11px; }
+    .deck input { width: 42px; }
+    .deck .lcustom[hidden] { display: none; }
+    .deck .lstat { font-size: 10px; }
+    .tcount { font-family: "JetBrains Mono", monospace; font-size: 10px; background: #000; color: var(--orange); padding: 1px 4px; border-radius: 3px; letter-spacing: .12em; }
+    /* Tape reel: CSS-only spin (compositor), and only while that layer rolls. */
+    .reel { width: 14px; height: 14px; border-radius: 50%; border: 2px dashed var(--muted); box-sizing: border-box; flex: none; }
+    .deck.rolling .reel { border-color: var(--cyan); animation: reel-spin 1.4s linear infinite; }
+    @keyframes reel-spin { to { transform: rotate(360deg); } }
+    @media (prefers-reduced-motion: reduce) { .deck.rolling .reel { animation: none; } }
     #mixer-panel summary { cursor: pointer; font-size: 14px; letter-spacing: .08em; }
     .mixer { display: grid; gap: 6px; margin-top: 10px; }
     .mix-row { display: grid; grid-template-columns: 90px repeat(4, minmax(0, 1fr)); gap: 8px; align-items: center; font-size: 10px; color: var(--muted); }
@@ -233,9 +276,10 @@
       <div class="pill" id="bpm-pill"><label for="bpm-num">BPM</label><input id="bpm" type="range" min="60" max="200" value="100" aria-label="Tempo"><input id="bpm-num" class="num" type="number" min="60" max="200" step="1" value="100" inputmode="numeric" aria-label="Tempo in BPM"><button class="mini" id="tap" type="button" title="Tap 2+ times to set the tempo">TAP</button></div>
       <div class="pill"><label>SWING</label><input id="swing" type="range" min="0" max="48" value="0"><b id="swing-val">0</b></div>
       <div class="pill"><label>VOL</label><input id="vol" type="range" min="0" max="1" step="0.01" value="0.85"></div>
-      <button class="btn" id="play" type="button">PLAY</button>
+      <button class="btn" id="play" type="button" disabled aria-label="Stop all: stops every section looper and the song">■ STOP ALL</button>
       <button class="btn on" id="limiter" type="button">LIMITER</button>
       <button class="btn" id="crt" type="button">CRT</button>
+      <button class="btn" id="tape" type="button" aria-pressed="false" title="Cassette colour: wow/flutter, warm saturation and hiss (inside the speaker-safety stage)">TAPE</button>
       <button class="btn" id="rec" type="button">○ REC</button>
       <div class="pill"><button class="mini" id="metro" type="button" aria-pressed="false" title="Metronome: speakers only, never recorded. Counts in one bar before REC.">METRO</button><input id="metro-vol" type="range" min="0" max="1" step="0.05" value="0.5" aria-label="Metronome volume"></div>
       <div class="pill"><button class="mini" id="undo" type="button" title="Undo (Ctrl/Cmd+Z)" disabled>UNDO</button><button class="mini" id="redo" type="button" title="Redo (Shift+Ctrl/Cmd+Z)" disabled>REDO</button><button class="mini" id="share" type="button" title="Copy or share a link to this beat">SHARE</button></div>
@@ -305,6 +349,19 @@
       <div class="drum-grid" id="perc"></div>
     </section>
 
+    <section class="panel" id="sampler">
+      <div class="row">
+        <h2 class="grotesk">SAMPLES <span>RECORD OR IMPORT · 8 PADS · UP TO 10 s EACH</span></h2>
+        <div class="controls">
+          <button class="btn" id="midi" type="button" aria-pressed="false">MIDI</button>
+        </div>
+      </div>
+      <div class="smp-grid" id="smp-grid"></div>
+      <input id="smp-file" type="file" accept="audio/*,.wav,.mp3,.m4a,.aac,.ogg,.flac,.aif,.aiff,.caf" hidden>
+      <p class="hint" id="smp-status" role="status" aria-live="polite">Tap REC to record from the mic (stops at 10 s) or LOAD to import an audio file (up to 10 MB). Samples are trimmed, normalised and kept in this browser. Use them as a track sound ("Your samples") in the sequencer. Share links point to your sample slots but don't include the audio.</p>
+      <p class="hint" id="midi-status" role="status" aria-live="polite"></p>
+    </section>
+
     <section class="panel">
       <div class="row">
         <h2 class="grotesk">SOUND BANKS <span>MEMPHIS · COLDWAVE · HOUSE · DSBM · VOCALS · AMBIENCE</span></h2>
@@ -326,6 +383,58 @@
           <button class="btn" id="dup" type="button">DUP</button>
         </div>
       </div>
+      <section class="sections-wrap" aria-label="Section loopers and song">
+        <p class="hint sec-hint">Each section has its own looper: tap its <b>▶ PLAY</b> to start it, tap another to layer it in at the next bar, tap a playing one to stop it. The letter picks which section you edit.</p>
+        <div class="sections" id="sections" role="group" aria-label="Section loopers A to D">
+          <div class="sec" data-sec="0">
+            <button class="mini pbank" data-pbank="0" type="button" aria-label="Edit section A">A</button>
+            <small class="sec-name" aria-hidden="true"></small>
+            <button class="sec-loop" data-loop="0" type="button" aria-pressed="false" aria-label="Play section A">▶ PLAY</button>
+            <select class="sec-len" data-seclen="0" aria-label="Section A loop length"><option value="8">½ bar</option><option value="16">1 bar</option><option value="32" selected>2 bars</option></select>
+            <span class="sec-live" data-live="0" aria-hidden="true">stopped</span>
+          </div>
+          <div class="sec" data-sec="1">
+            <button class="mini pbank" data-pbank="1" type="button" aria-label="Edit section B">B</button>
+            <small class="sec-name" aria-hidden="true"></small>
+            <button class="sec-loop" data-loop="1" type="button" aria-pressed="false" aria-label="Play section B">▶ PLAY</button>
+            <select class="sec-len" data-seclen="1" aria-label="Section B loop length"><option value="8">½ bar</option><option value="16">1 bar</option><option value="32" selected>2 bars</option></select>
+            <span class="sec-live" data-live="1" aria-hidden="true">stopped</span>
+          </div>
+          <div class="sec" data-sec="2">
+            <button class="mini pbank" data-pbank="2" type="button" aria-label="Edit section C">C</button>
+            <small class="sec-name" aria-hidden="true"></small>
+            <button class="sec-loop" data-loop="2" type="button" aria-pressed="false" aria-label="Play section C">▶ PLAY</button>
+            <select class="sec-len" data-seclen="2" aria-label="Section C loop length"><option value="8">½ bar</option><option value="16">1 bar</option><option value="32" selected>2 bars</option></select>
+            <span class="sec-live" data-live="2" aria-hidden="true">stopped</span>
+          </div>
+          <div class="sec" data-sec="3">
+            <button class="mini pbank" data-pbank="3" type="button" aria-label="Edit section D">D</button>
+            <small class="sec-name" aria-hidden="true"></small>
+            <button class="sec-loop" data-loop="3" type="button" aria-pressed="false" aria-label="Play section D">▶ PLAY</button>
+            <select class="sec-len" data-seclen="3" aria-label="Section D loop length"><option value="8">½ bar</option><option value="16">1 bar</option><option value="32" selected>2 bars</option></select>
+            <span class="sec-live" data-live="3" aria-hidden="true">stopped</span>
+          </div>
+        </div>
+        <div class="bank-bar" id="bank-bar" role="group" aria-label="Song chain">
+          <button class="mini" id="song" type="button" aria-pressed="false">▶ SONG</button>
+          <span class="chain" id="chain" role="group" aria-label="Song chain"></span>
+          <span class="chain-add" role="group" aria-label="Add a section to the end of the song">
+            <button class="mini" data-append="0" type="button" aria-label="Add section A to the song">+A</button>
+            <button class="mini" data-append="1" type="button" aria-label="Add section B to the song">+B</button>
+            <button class="mini" data-append="2" type="button" aria-label="Add section C to the song">+C</button>
+            <button class="mini" data-append="3" type="button" aria-label="Add section D to the song">+D</button>
+          </span>
+          <button class="mini" id="chain-del" type="button" aria-label="Remove the last section from the song">⌫</button>
+          <button class="mini" id="chain-clear" type="button" aria-label="Clear the song chain">CLEAR</button>
+        </div>
+        <div class="bank-bar">
+          <button class="mini" id="bank-copy" type="button" aria-label="Copy the section you are editing">COPY</button>
+          <button class="mini" id="bank-paste" type="button" disabled aria-label="Paste into the section you are editing">PASTE</button>
+          <button class="mini" id="classic-load" type="button" title="Reload the four classic TR-808 sections (undoable)">LOAD CLASSIC 808</button>
+          <span class="hint" id="bank-status" role="status" aria-live="polite"></span>
+        </div>
+      </section>
+      <p class="hint">Presets only load into the section you are editing when you tap one.</p>
       <div class="note-strip" id="presets"></div>
       <div class="slots">
         <input id="slot-name" type="text" maxlength="40" placeholder="Beat name" aria-label="Beat name">
@@ -333,20 +442,6 @@
         <select id="slot-list" aria-label="Saved beats"></select>
         <button class="btn" id="slot-load" type="button">LOAD</button>
         <button class="btn" id="slot-del" type="button">DELETE</button>
-      </div>
-      <div class="bank-bar" id="bank-bar" role="group" aria-label="Pattern banks and song">
-        <span class="hint">BANK</span>
-        <button class="mini pbank" data-pbank="0" type="button" aria-label="Bank A">A</button>
-        <button class="mini pbank" data-pbank="1" type="button" aria-label="Bank B">B</button>
-        <button class="mini pbank" data-pbank="2" type="button" aria-label="Bank C">C</button>
-        <button class="mini pbank" data-pbank="3" type="button" aria-label="Bank D">D</button>
-        <button class="mini" id="bank-copy" type="button">COPY</button>
-        <button class="mini" id="bank-paste" type="button" disabled>PASTE</button>
-        <button class="mini" id="song" type="button" aria-pressed="false">SONG</button>
-        <span class="chain" id="chain" role="group" aria-label="Song chain"></span>
-        <button class="mini" id="chain-add" type="button" aria-label="Add current bank to the song chain">+</button>
-        <button class="mini" id="chain-del" type="button" aria-label="Remove the last bank from the song chain">−</button>
-        <span class="hint" id="bank-status" role="status" aria-live="polite"></span>
       </div>
       <div class="track-bar" id="track-bar">
         <button class="btn arrow" id="trk-prev" type="button" aria-label="Previous track">◀</button>
@@ -356,7 +451,7 @@
         <button class="ms" id="trk-solo" type="button" aria-label="Solo selected track">S</button>
         <select id="trk-src" aria-label="Sound for selected track"></select>
       </div>
-      <p class="hint">Banks A–D hold four patterns; while playing, a new bank starts at the next loop. SONG plays the chain (tap a chain chip to change it). Tap a step, then use the step bar for velocity, rolls (1/2–1/6), chance, length and 808 slide (glides from the previous note). Select a track, pick a note or chord, then tap steps. On a phone you see one track at a time: swipe or use ◀ ▶ to switch ([ and ] on a keyboard). Hold, right-click or shift-click a step to cycle its velocity (40 → 60 → 80 → 100%); brighter = louder. Everything autosaves; CLEAR, RANDOMIZE and presets can be undone. 808 and chord tracks store a pitch per step.</p>
+      <p class="hint">Sections A–D are four patterns (fresh sessions start with 2-bar classic 808 trap at 145 BPM: A TRAP, B RAGE, C DARK breakdown, D FILL). Every section has its own looper: its ▶ PLAY loops just that section (½, 1 or 2 bars); tap other sections' ▶ PLAY while it runs and they join in sync at the next bar, layered; tap a playing section to stop it. ■ STOP ALL (top bar) stops everything. ▶ SONG plays the chain in order and loops it; build it with +A–D, ⌫ removes the last part, CLEAR empties it, and tapping a chain chip changes that part. Switching between section loopers and the song never stops the beat. Tap a section letter to edit it; LOAD CLASSIC 808 brings the classic sections back (undoable). Tap a step, then use the step bar for velocity, rolls (1/32 to 1/128 and triplet runs, with ramps), chance, length and 808 slide (glides from the previous note). Select a track, pick a note or chord, then tap steps. On a phone you see one track at a time: swipe or use ◀ ▶ to switch ([ and ] on a keyboard). Hold, right-click or shift-click a step to cycle its velocity (40 → 60 → 80 → 100%); brighter = louder. Everything autosaves; CLEAR, RANDOMIZE and presets can be undone. 808 and chord tracks store a pitch per step.</p>
       <div class="note-strip" id="paint-notes"></div>
       <div class="seq-wrap" id="seq-wrap">
         <div class="seq" id="seq" role="group" aria-label="Steps: arrow keys move, Enter or Space toggles"></div>
@@ -364,9 +459,10 @@
       <div class="insp" id="insp" role="group" aria-label="Selected step">
         <span class="hint" id="insp-title">STEP —</span>
         <label>VEL <input id="insp-vel" type="range" min="0.05" max="1" step="0.05" value="0.85"><span class="val" id="insp-vel-val"></span></label>
-        <label>ROLL <select id="insp-rat"><option value="1">off</option><option value="2">1/2 ×2</option><option value="3">1/3 ×3</option><option value="4">1/4 ×4</option><option value="6">1/6 ×6</option></select></label>
+        <label>ROLL <select id="insp-rat"><option value="1">off</option><option value="2">1/32 ×2</option><option value="3">1/48 ×3</option><option value="4">1/64 ×4</option><option value="6">1/96 ×6</option><option value="8">1/128 ×8</option><option value="1.5">1/24 triplet run</option><option value="0.75">1/12 triplet run</option></select></label>
+        <label>RAMP <select id="insp-ramp"><option value="0">none</option><option value="1">louder ↗</option><option value="2">softer ↘</option><option value="3">pitch up ⤴</option><option value="4">pitch down ⤵</option><option value="5">louder + pitch up</option><option value="6">softer + pitch down</option></select></label>
         <label>CHANCE <select id="insp-prob"><option value="1">100%</option><option value="0.75">75%</option><option value="0.5">50%</option><option value="0.25">25%</option></select></label>
-        <label>LEN <select id="insp-gate"><option value="0">auto</option><option value="0.5">½ step</option><option value="1">1 step</option><option value="2">2 steps</option><option value="4">4 steps</option><option value="8">8 steps</option></select></label>
+        <label>LEN <select id="insp-gate"><option value="0">auto</option><option value="0.5">½ step</option><option value="1">1 step</option><option value="2">2 steps</option><option value="4">4 steps</option><option value="8">8 steps</option><option value="12">12 steps</option><option value="16">16 steps (1 bar)</option></select></label>
         <button class="mini" id="insp-slide" type="button" aria-pressed="false">SLIDE</button>
       </div>
       <p id="toast"></p>
@@ -376,6 +472,16 @@
       <summary class="grotesk">MIXER <span class="hint">VOLUME · PAN · REVERB · DELAY PER TRACK</span></summary>
       <div class="mixer" id="mixer"></div>
       <p class="hint">Reverb and delay are shared returns (one of each, created only when a send is up). Pads and keys you play live skip the mixer.</p>
+    </details>
+
+    <details class="panel" id="deck-panel">
+      <summary class="grotesk">TAPE DECK <span class="hint">PLAY · LOOP · STOP · REWIND PER LAYER</span></summary>
+      <div class="deck-head">
+        <button class="mini" id="deck-all" type="button" aria-label="Play every layer in sync from the next bar">▶ ALL IN SYNC</button>
+        <span class="hint">Changes land on the next bar line.</span>
+      </div>
+      <div class="deck-list" id="deck"></div>
+      <p class="hint">Every track is a cassette layer. ▶ plays it in sync with the beat, ⟲ loops it on its own over the length you pick (¼ bar to 2 bars, or custom steps), so a 1-bar hat loop can ride over a 2-bar 808 line. ■ stops that layer, ◀◀ rewinds it to the top of its loop. While the beat plays, each change waits for the next bar so nothing falls out of time; ▶ ALL IN SYNC brings every layer back together. Mute / solo, sections and song mode still apply. TAPE (top bar) adds wow, flutter, warm saturation and hiss.</p>
     </details>
 
     <section class="panel" id="tools">

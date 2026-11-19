@@ -3,7 +3,8 @@
 // on an OfflineAudioContext — glitch-free regardless of device load.
 import { Studio } from "./audio.mjs";
 import { encodeWav, trimTail } from "./wav.mjs";
-import { bankForLoop, stepHits, seededRng } from "./sequencer.mjs";
+import { bankForLoop, layerHits, seededRng } from "./sequencer.mjs";
+import { looperHits, activeLoopers } from "./loopers.mjs";
 
 export const EXPORT_BARS = [1, 2, 4, 8];
 export const EXPORT_RATE = 48000;
@@ -21,7 +22,9 @@ export function exportSteps(state, bars) {
 }
 
 /** Same timing, mute/solo, ratchet, probability and song rules as the live scheduler. */
-export function scheduleSteps(state, bars, startAt = 0, rng = seededRng(1)) {
+export function scheduleSteps(state, bars, startAt = 0, rng = seededRng(1), layers = null, loopers = null) {
+  // Section loopers (outside song mode): every playing section, layered.
+  const layered = !state.song && Array.isArray(loopers) && Array.isArray(state.banks) && activeLoopers(loopers).length > 0;
   const stepSec = 60 / state.bpm / 4;
   const total = exportSteps(state, bars);
   const banks = Array.isArray(state.banks) ? state.banks : [state.pattern];
@@ -30,9 +33,10 @@ export function scheduleSteps(state, bars, startAt = 0, rng = seededRng(1)) {
     const step = i % state.length;
     const loop = Math.floor(i / state.length);
     const pattern = Array.isArray(state.banks) ? banks[bankForLoop(state, loop)] : state.pattern;
-    const swing = step % 2 === 1 ? (state.swing / 100) * stepSec * 0.5 : 0;
+    const swing = i % 2 === 1 ? (state.swing / 100) * stepSec * 0.5 : 0;
     const when = startAt + i * stepSec + swing;
-    for (const h of stepHits(pattern, step, stepSec, rng)) {
+    const hits = layered ? looperHits(state.banks, loopers, layers, i, stepSec, state.length, rng) : layerHits(pattern, layers, i, step, stepSec, rng);
+    for (const h of hits) {
       events.push({ source: h.source, cell: h.cell, when: when + h.at, vel: h.vel, opts: h.opts });
     }
   }
@@ -44,7 +48,7 @@ export function scheduleSteps(state, bars, startAt = 0, rng = seededRng(1)) {
  * Render `bars` bars to WAV.
  * @returns {Promise<{blob: Blob, seconds: number, peak: number, channels: Float32Array[]}>}
  */
-export async function renderWav(state, { bars = 4, bitDepth = 16, masterGain = 0.85, onProgress = () => {} } = {}) {
+export async function renderWav(state, { bars = 4, bitDepth = 16, masterGain = 0.85, samples = null, tape = false, layers = null, loopers = null, onProgress = () => {} } = {}) {
   const Ctor = globalThis.OfflineAudioContext || globalThis.webkitOfflineAudioContext;
   if (!Ctor) throw new Error("This browser can't render audio offline");
   const music = (60 / state.bpm / 4) * exportSteps(state, bars);
@@ -56,14 +60,16 @@ export async function renderWav(state, { bars = 4, bitDepth = 16, masterGain = 0
   s.keepAwake = true;
   s.masterGain = masterGain;
   s.limiterOn = !!state.limiter;
+  s.tapeOn = !!tape;
   s.patch = { ...s.patch, ...state.patch };
   s.build();
   s.applyPatch();
   s.setMixer(state.mixer);
+  if (samples) for (const [slot, rec] of samples) s.setSample(slot, rec);
   s.setSendTempo(state.bpm);
   // Metronome stays silent: metroBus gain is 0 and no clicks are scheduled.
   const start = 0.02;
-  const events = scheduleSteps(state, bars, start);
+  const events = scheduleSteps(state, bars, start, seededRng(1), layers, loopers);
   let next = 0;
   const scheduleUntil = (t) => {
     while (next < events.length && events[next].when < t) {

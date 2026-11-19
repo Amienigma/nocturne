@@ -7,8 +7,11 @@ import {
   sourceIsN808,
   sourceIsChord,
   pitWaveFromSource,
+  sampleSlotFromSource,
+  sourceIsTr808,
 } from "./music.mjs";
 import { pickRecordType, extensionForType } from "./state-io.mjs";
+import { makeBuffer } from "./samples.mjs";
 
 function distortionCurve(amount) {
   const n = 256;
@@ -96,6 +99,7 @@ function hardCeilingCurve(ceiling) {
   return curve;
 }
 
+export const TR808_LEVEL = 0.75; // classic 808 kit voice trim (see play808)
 export const METRO_MAX = 0.3; // click peak at full metronome volume
 
 // Fold sub-sonic fundamentals up by octaves so the note name stays the same
@@ -140,7 +144,11 @@ export class Studio {
     this.route = null; // strip the voice being triggered right now goes to
     this.glide = null; // { fromHz, sec } while triggering a slid step
     this.trackHz = new Map();
+    this.sampleRecs = new Map(); // slot (1-8) -> { name, rate, pcm }
+    this.samples = new Map(); // slot -> AudioBuffer for this.ctx (built on first use)
     this.limiterOn = true;
+    this.tapeOn = false; // TAPE: wow/flutter + saturation + hiss, before the safety stage
+    this.tape = null;
     this.masterGain = 0.85;
     this.patch = { ...DEFAULT_PATCH };
     this.voices = new Map();
@@ -263,13 +271,14 @@ export class Studio {
     this.mild = distortionCurve(1.5);
     this.heavy = distortionCurve(3.4);
 
-    for (const name of ["808", "Drums", "Memphis", "Coldwave", "House", "DSBM", "Vocals", "Ambience"]) {
+    for (const name of ["808", "Drums", "Memphis", "Coldwave", "House", "DSBM", "Vocals", "Ambience", "Samples"]) {
       const g = ctx.createGain();
       g.gain.value = 0.85;
       g.connect(this.master);
       this.buses[name] = g;
     }
     this.pitFilter.connect(this.buses["808"]);
+    if (this.tapeOn) this.rewireMaster(); // TAPE needs the pink-noise buffer above
   }
 
   // Always-on safety stage (cannot be bypassed by the LIMITER button):
@@ -343,7 +352,8 @@ export class Studio {
     try { this.master.disconnect(); } catch { /* first wire */ }
     try { this.trim.disconnect(); } catch { /* first wire */ }
     try { this.compressor.disconnect(); } catch { /* first wire */ }
-    this.master.connect(this.trim);
+    if (this.tapeOn && this.pink) this.master.connect(this.ensureTape().in);
+    else this.master.connect(this.trim);
     const post = this.limiterOn ? POST_GAIN_LIMITER : POST_GAIN_DIRECT;
     this.post.gain.setTargetAtTime(post, this.ctx.currentTime, 0.02);
     if (this.limiterOn) {
@@ -482,6 +492,65 @@ export class Studio {
         this.armIdleCheck();
       }
     }
+  }
+
+  // ---- TAPE (cassette) colour --------------------------------------------
+  // master -> delay modulated by a slow "wow" (0.55 Hz) and a "flutter"
+  // (6.5 Hz) LFO -> gentle level-matched tanh saturation -> trim, plus a
+  // quiet high-passed hiss. It all sits *before* the always-on safety stage,
+  // so the ceiling still holds. Nodes exist only while TAPE is on, and the
+  // whole context still suspends when idle.
+  ensureTape() {
+    if (this.tape) return this.tape;
+    const C = this.ctx;
+    const t = C.currentTime;
+    const input = C.createGain();
+    const delay = C.createDelay(0.05);
+    delay.delayTime.value = 0.008;
+    const wow = C.createOscillator();
+    wow.frequency.value = 0.55;
+    const wowAmt = C.createGain();
+    wowAmt.gain.value = 0.0011; // ~±0.8 cents·s → a few cents of pitch wobble
+    const flutter = C.createOscillator();
+    flutter.frequency.value = 6.5;
+    const flutAmt = C.createGain();
+    flutAmt.gain.value = 0.00009;
+    wow.connect(wowAmt).connect(delay.delayTime);
+    flutter.connect(flutAmt).connect(delay.delayTime);
+    const sat = C.createWaveShaper();
+    sat.curve = distortionCurve(1.25);
+    sat.oversample = "2x";
+    const comp = C.createGain();
+    comp.gain.value = 0.82; // level-match: TAPE adds colour, not loudness
+    const tone = C.createBiquadFilter();
+    tone.type = "lowpass";
+    tone.frequency.value = 13500;
+    input.connect(delay).connect(sat).connect(comp).connect(tone).connect(this.trim);
+    const hiss = C.createBufferSource();
+    hiss.buffer = this.pink;
+    hiss.loop = true;
+    const hissHp = C.createBiquadFilter();
+    hissHp.type = "highpass";
+    hissHp.frequency.value = 3500;
+    const hissGain = C.createGain();
+    hissGain.gain.value = 0.006; // about -60 dBFS after the mix trim
+    hiss.connect(hissHp).connect(hissGain).connect(this.trim);
+    wow.start(t);
+    flutter.start(t);
+    hiss.start(t);
+    this.tape = { in: input, nodes: [wow, flutter, hiss], out: [tone, hissGain] };
+    return this.tape;
+  }
+
+  setTape(on) {
+    this.tapeOn = !!on;
+    if (!this.ctx) return;
+    if (!this.tapeOn && this.tape) {
+      for (const n of this.tape.nodes) { try { n.stop(); } catch { /* done */ } }
+      for (const n of this.tape.out) { try { n.disconnect(); } catch { /* done */ } }
+      this.tape = null;
+    }
+    this.rewireMaster();
   }
 
   setLimiter(on) {
@@ -1506,12 +1575,14 @@ export class Studio {
     const melodic = sourceIsPit(source) || sourceIsN808(source);
     this.glide = opts.slide && melodic && prevHz ? { fromHz: prevHz, sec: Math.max(0.03, opts.slideSec || 0.08) } : null;
     this.gateSec = opts.gate > 0 ? opts.gate : 0;
+    this.pitchSemi = Number.isFinite(opts.pitch) ? opts.pitch : 0;
     try {
       this.playSource(source, step, when, velocity);
     } finally {
       this.route = null;
       this.glide = null;
       this.gateSec = 0;
+      this.pitchSemi = 0;
     }
     if (melodic && track >= 0) this.trackHz.set(track, this.lastHz);
   }
@@ -1544,7 +1615,235 @@ export class Studio {
       for (const n of hit.notes ?? []) this.firePit(n, t, vel, wave, hold);
       return;
     }
+    if (sourceIsTr808(source)) {
+      this.play808(source.slice(3), t, vel, step?.note, gate, this.pitchSemi || 0);
+      return;
+    }
+    const slot = sampleSlotFromSource(source);
+    if (slot) {
+      this.playSample(slot, t, vel, gate);
+      return;
+    }
     this.playNamed(source, t, vel);
+  }
+
+  // ---- Classic TR-808 voices ----------------------------------------------
+  // Modelled on the 808's circuits: bridged-T sine bass drum with a short
+  // pitch blip, two-tone snare + snappy noise, multi-burst clap, six detuned
+  // square "metal" oscillators (205-800 Hz) for hats/cymbal, two-square
+  // cowbell, tuned toms, rimshot, clave and maracas. Hats share one
+  // pre-rendered metal buffer, so a 1/32 roll costs one buffer source per hit.
+  metalBuffer() {
+    if (this.metal808 && this.metal808.sampleRate === this.ctx.sampleRate) return this.metal808;
+    const rate = this.ctx.sampleRate;
+    const n = Math.round(rate * 0.6);
+    const buf = this.ctx.createBuffer(1, n, rate);
+    const d = buf.getChannelData(0);
+    const freqs = [205.3, 304.4, 369.6, 522.7, 540, 800];
+    for (let i = 0; i < n; i++) {
+      let x = 0;
+      for (const f of freqs) x += ((i * f) / rate) % 1 < 0.5 ? 1 : -1;
+      d[i] = x / freqs.length;
+    }
+    this.metal808 = buf;
+    return buf;
+  }
+
+  play808(id, when, velocity = 0.9, midi = null, gate = 0, pitch = 0) {
+    if (!this.arm()) return;
+    const C = this.ctx;
+    const t = when;
+    // TR808_LEVEL gain-stages the kit so a busy classic groove peaks around
+    // -6 dBFS before the safety stage, like the rest of the app.
+    const v = Math.min(1, Math.max(0.05, velocity)) * TR808_LEVEL;
+    const out = this.busFor("Drums");
+    const chk = C.createGain(); // choke / gate gain (1 -> 0 on choke)
+    chk.connect(out);
+    const srcs = [];
+    let end = t + 0.1;
+    const decayEnv = (g, peak, dec, start = t, attack = 0.0015) => {
+      g.gain.setValueAtTime(0, start);
+      g.gain.linearRampToValueAtTime(peak, start + attack);
+      g.gain.exponentialRampToValueAtTime(0.0005, start + attack + dec);
+      g.gain.setValueAtTime(0, start + attack + dec + 0.001);
+      end = Math.max(end, start + attack + dec + 0.02);
+    };
+    // Roll pitch ramps: `pitch` semitones on every oscillator / noise source.
+    const semi = Math.max(-12, Math.min(12, pitch || 0));
+    const osc = (type, hz, dest) => {
+      const o = C.createOscillator();
+      o.type = type;
+      o.frequency.setValueAtTime(hz, t);
+      if (semi) o.detune.value = semi * 100;
+      o.connect(dest);
+      srcs.push(o);
+      return o;
+    };
+    const noise = (dest, buffer = this.white) => {
+      const b = C.createBufferSource();
+      b.buffer = buffer;
+      if (semi) b.playbackRate.value = Math.pow(2, semi / 12);
+      b.connect(dest);
+      srcs.push(b);
+      return b;
+    };
+    const filter = (type, hz, q, dest) => {
+      const f = C.createBiquadFilter();
+      f.type = type;
+      f.frequency.value = hz;
+      f.Q.value = q;
+      f.connect(dest);
+      return f;
+    };
+    const amp = (dest = chk) => {
+      const g = C.createGain();
+      g.connect(dest);
+      return g;
+    };
+    let group = null;
+    if (id === "BD") {
+      // ~49 Hz body (a hair above the safety high-pass), 4:1 pitch blip, long boom.
+      const body = amp();
+      const o = osc("sine", 49 * 3.2, body);
+      o.frequency.exponentialRampToValueAtTime(49 * 1.15, t + 0.025);
+      o.frequency.exponentialRampToValueAtTime(49, t + 0.12);
+      decayEnv(body, v * 0.95, 0.42 + v * 0.38);
+      const click = amp();
+      noise(filter("lowpass", 2600, 0.7, click));
+      decayEnv(click, v * 0.18, 0.008);
+      group = "tr:BD";
+    } else if (id === "SD") {
+      const tone = amp();
+      osc("triangle", 238, tone);
+      decayEnv(tone, v * 0.5, 0.11);
+      const tone2 = amp();
+      osc("sine", 476, tone2);
+      decayEnv(tone2, v * 0.22, 0.07);
+      const snap = amp();
+      noise(filter("highpass", 1800, 0.6, filter("lowpass", 9000, 0.5, snap)));
+      decayEnv(snap, v * 0.48, 0.17 + v * 0.05);
+    } else if (id === "CP") {
+      const g = amp();
+      noise(filter("bandpass", 1150, 1.3, filter("highpass", 600, 0.5, g)));
+      g.gain.setValueAtTime(0, t);
+      for (let k = 0; k < 3; k++) {
+        const s = t + k * 0.0105;
+        g.gain.setValueAtTime(v * 0.95, s);
+        g.gain.exponentialRampToValueAtTime(v * 0.12, s + 0.0095);
+      }
+      const tail = t + 0.0315;
+      g.gain.setValueAtTime(v * 0.8, tail);
+      g.gain.exponentialRampToValueAtTime(0.0005, tail + 0.19);
+      g.gain.setValueAtTime(0, tail + 0.191);
+      end = tail + 0.21;
+    } else if (id === "CH" || id === "OH") {
+      const g = amp();
+      const b = noise(filter("highpass", 7200, 0.7, filter("bandpass", 10000, 0.9, g)), this.metalBuffer());
+      b.loop = true;
+      decayEnv(g, v * (id === "OH" ? 0.62 : 0.7), id === "OH" ? 0.34 + v * 0.12 : 0.045);
+      group = "tr:HH"; // closed hat chokes the open hat, like the real machine
+    } else if (id === "CB") {
+      const g = amp();
+      const f = filter("bandpass", 1150, 0.55, g);
+      osc("square", 540, f);
+      osc("square", 800, f);
+      g.gain.setValueAtTime(0, t);
+      g.gain.linearRampToValueAtTime(v * 0.42, t + 0.001);
+      g.gain.exponentialRampToValueAtTime(v * 0.13, t + 0.03);
+      g.gain.exponentialRampToValueAtTime(0.0005, t + 0.34);
+      g.gain.setValueAtTime(0, t + 0.341);
+      end = t + 0.36;
+      group = "tr:CB";
+    } else if (id === "TOM") {
+      const hz = Math.min(400, Math.max(60, midiToHz(midi ?? 48)));
+      const g = amp();
+      const o = osc("sine", hz * 1.3, g);
+      o.frequency.exponentialRampToValueAtTime(hz, t + 0.07);
+      decayEnv(g, v * 0.78, hz < 110 ? 0.5 : hz < 160 ? 0.38 : 0.3);
+      const n = amp();
+      noise(filter("lowpass", hz * 6, 0.7, n), this.pink);
+      decayEnv(n, v * 0.06, 0.08);
+      group = "tr:TOM";
+    } else if (id === "RS") {
+      const g = amp();
+      const hp = filter("highpass", 380, 0.7, g);
+      osc("triangle", 1700, hp);
+      osc("sine", 455, hp);
+      decayEnv(g, v * 0.5, 0.028);
+    } else if (id === "CL") {
+      const g = amp();
+      osc("sine", 2500, g);
+      decayEnv(g, v * 0.42, 0.035);
+    } else if (id === "MA") {
+      const g = amp();
+      noise(filter("highpass", 5200, 0.7, g));
+      decayEnv(g, v * 0.32, 0.045, t, 0.004);
+    } else {
+      chk.disconnect();
+      return;
+    }
+    if (gate > 0 && t + gate < end) {
+      chk.gain.setValueAtTime(1, t + gate);
+      chk.gain.linearRampToValueAtTime(0, t + gate + 0.012);
+      end = t + gate + 0.03;
+    }
+    for (const s of srcs) {
+      s.start(t);
+      s.stop(end);
+    }
+    srcs[0]?.addEventListener("ended", () => {
+      try { chk.disconnect(); } catch { /* gone */ }
+    });
+    if (group) this.choke(group, t, chk, (at) => { for (const s of srcs) { try { s.stop(at); } catch { /* done */ } } });
+  }
+
+  /** Install (or remove with null) a user sample record { name, rate, pcm: Int16Array }. */
+  setSample(slot, rec) {
+    this.samples.delete(slot);
+    if (rec) this.sampleRecs.set(slot, rec);
+    else this.sampleRecs.delete(slot);
+  }
+
+  sampleBuffer(slot) {
+    let buf = this.samples.get(slot);
+    if (!buf) {
+      const rec = this.sampleRecs.get(slot);
+      if (!rec || !this.ctx) return null;
+      buf = makeBuffer(this.ctx, rec);
+      this.samples.set(slot, buf);
+    }
+    return buf;
+  }
+
+  // One-shot sample voice. Samples are stored normalised to -6 dBFS; a new
+  // hit on the same slot chokes the last one (mono, like an MPC pad), so
+  // rolls never stack up.
+  playSample(slot, when, velocity = 0.9, gate = 0) {
+    if (!this.arm()) return;
+    const buf = this.sampleBuffer(slot);
+    if (!buf) return;
+    const C = this.ctx;
+    const src = C.createBufferSource();
+    src.buffer = buf;
+    const g = C.createGain();
+    const vel = Math.min(1, Math.max(0.05, velocity));
+    g.gain.setValueAtTime(vel, when);
+    const chk = C.createGain();
+    src.connect(g);
+    g.connect(chk);
+    chk.connect(this.busFor("Samples"));
+    const dur = gate > 0 ? Math.min(gate, buf.duration) : buf.duration;
+    if (dur < buf.duration) {
+      g.gain.setValueAtTime(vel, when + Math.max(0, dur - 0.01));
+      g.gain.linearRampToValueAtTime(0, when + dur);
+    }
+    src.start(when);
+    src.stop(when + dur + 0.02);
+    src.addEventListener("ended", () => {
+      try { g.disconnect(); } catch { /* gone */ }
+      try { chk.disconnect(); } catch { /* gone */ }
+    });
+    this.choke(`smp:${slot}`, when, chk, (t) => { try { src.stop(t); } catch { /* done */ } });
   }
 
   playNamed(name, when, velocity = 0.9) {

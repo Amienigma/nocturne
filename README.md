@@ -17,17 +17,41 @@ NOCTURNE brings the synth keyboard, trap drum pad, genre banks and 12-track step
 - Shared master gain plus a limiter/compressor, speaker protection, a CRT look, and **REC**. The recording format is whatever the browser supports: `.m4a` on Safari/iPhone, otherwise `.webm` or `.ogg`
 
 ### Banks, song mode and trap steps
-- **Pattern banks A–D:** four patterns per beat. Bank buttons switch instantly when stopped. While playing, the new bank starts at the next loop. COPY / PASTE copies a bank (paste is undoable)
-- **Song mode:** build a chain of up to 16 banks (+ adds the current bank, − removes the last, tap a chip to change it). With SONG on, playback walks the chain and loops it. EXPORT WAV then renders the whole chain once
+- **Classic 808 trap sections:** a fresh session (nothing autosaved, no share link) opens with four original 2-bar trap grooves at **145 BPM, no swing**, in Ab minor, so the first thing you hear is a real 808 trap beat. Section A is selected and starts the chain. **A TRAP** (Pi'erre / Metro-era: long, saturated 808 carrying the melody with octave slides, a short kick on every 808 hit, snare + clap on beat 3, rolling hats, open hats, a dark sine bell), **B RAGE** (Carti-style: distorted 808 bouncing between octaves, stacked 1/64–1/128 hat risers, 1/12 triplet runs, a double clap), **C DARK** (stripped breakdown: long 808 notes, rim/perc, quiet rolling hats, bell) and **D FILL** (trap bar, then high-to-low toms and a snare roll that speeds up into the loop). **Rolling hats are the signature:** constant 16ths with 1/32, 1/48, 1/64, 1/96 and 1/128 stutters, 1/24 and 1/12 triplet runs, and rolls that get louder and rise in pitch into every snare and at every bar end. They use a circuit-modelled **TR-808 kit** (bass drum, snare, clap, closed/open hats with choke, cowbell, tuned toms, rimshot, clave, maracas), available on any track as "TR-808 classic" sounds. Saved beats are never replaced; **LOAD CLASSIC 808** brings the four sections back at any time (undoable)
+- **A looper per section (no hidden preset):** each section card has its own big **▶ PLAY**, a loop length (**½ bar, 1 bar or 2 bars**) and a live indicator (● bar 1/2, ◷ next bar, stopped). Tap a section's ▶ PLAY to start just that section. Tap another section's ▶ PLAY while it runs and it **joins in sync at the next bar**, layered on top, so A + C (or all four) can play together. Tap a playing section's ■ STOP to stop just that one (the last one stops the beat). Changing a playing looper's length restarts it at the next bar. The top-bar button is **■ STOP ALL**: it only stops; sound always starts from a section's ▶ PLAY, ▶ SONG, or the tape deck. Space plays the section you're editing (and stops all while playing). The letter (A–D) only picks which section you edit. Presets only load into a section when you tap one. An old autosave that is still the untouched ATLANTA NIGHT starter from the previous build is swapped for the trap sections. COPY / PASTE copies a section (paste is undoable)
+- **Song mode (bring it together):** the chain (default A A B A C D, up to 16 parts) plays the sections in order and loops. Build it with **+A +B +C +D**, **⌫** removes the last part, **CLEAR** empties it, tapping a chip changes that part. **▶ SONG** starts the song, or, while a section is looping, switches to the song at the next bar; ▶ PLAY on any section leaves the song for that section's looper at the next bar. The transport never stops. EXPORT WAV in song mode renders the whole chain once
 - **Step settings** (tap a step, then use the step bar under the grid):
-  - **Roll:** 1/2, 1/3, 1/4 or 1/6 ratchets inside one step. Later hits are slightly softer
+  - **Roll:** 1/32 ×2, 1/48 ×3, 1/64 ×4, 1/96 ×6 or 1/128 ×8 inside one step, or a 1/24 (over 2 steps) or 1/12 (over 4 steps) triplet run. Leave the steps a triplet run covers empty
+  - **Ramp:** shapes a roll: louder (crescendo), softer, pitch up, pitch down, louder + up (the classic trap riser) or softer + down. With no ramp, later hits are just slightly softer, as before. Old share links open unchanged
   - **Chance:** 100, 75, 50 or 25%, rolled each time the step comes round
-  - **Length:** auto, or ½ to 8 steps for 808, synth and chord notes
+  - **Length:** auto, or ½ to 16 steps for 808, synth and chord notes
   - **Slide:** 808 and synth notes glide from the previous note on that track instead of retriggering the punch
 - Steps show these with a ×N badge (roll), a dashed/striped pad (chance), ↗ (slide), and a bar along the bottom for velocity, so nothing is shown by colour alone
 
+### Tape deck (loop each layer)
+
+Open **TAPE DECK** (collapsible, under the sections). Every track is a cassette layer with its own transport:
+
+- **▶ PLAY**: the layer plays in sync with the beat (the default)
+- **⟲ LOOP**: the layer loops on its own over the length you pick: ¼ bar, ½ bar, 1 bar, 2 bars, or custom start/end steps. Layers with different lengths run against each other (polymetric), all locked to the same clock
+- **■ STOP**: silences that layer; **◀◀ REWIND** restarts it from the top of its loop
+- While the beat plays, every change waits for the **next bar line**, so nothing falls out of time (the row says "… at next bar"). Pressing ▶ or ⟲ while stopped starts the transport
+- **▶ ALL IN SYNC** puts every layer back to PLAY together at the next bar
+- Each row has a reel that turns only while that layer is rolling (CSS, no animation loop when idle) and a tape counter that counts passes, updated once per bar while the deck is open
+- Mute, solo, sections and song mode still apply. Loop lengths and TAPE are kept in the autosave; share links are unchanged. EXPORT WAV renders what the deck is doing (loops start at the top of the file)
+- Loops max out at 2 bars, because a section is 32 steps long
+- **TAPE** (top bar, off by default) adds gentle wow and flutter, warm saturation, a soft top end and faint hiss. It sits before the speaker-safety stage, so peaks stay under −1.2 dBFS
+
 ### Mixer
 Each of the 12 tracks has volume, pan, reverb send and delay send (the MIXER panel, collapsed by default). There is one shared reverb and one tempo-synced dotted-⅛ delay, built only when a send is first turned up. At default settings the mix sounds exactly as before. The mixer applies to the sequencer and to exports. Pads and keys you play live skip it. Double-click a fader to reset it.
+
+### Samples and MIDI
+- **SAMPLES:** 8 pads. **REC** records from the microphone (stops by itself at 10 s). **LOAD** imports an audio file (WAV, MP3, M4A/AAC, OGG…, up to 10 MB).
+  - Each sample is trimmed of silence, mixed to mono, cut to 10 s, normalised to −6 dBFS and faded so it never clicks. It is kept in this browser (IndexedDB, 16-bit, about 1 MB per 10 s).
+  - Tap a pad to play it. Pick it as a track sound ("Your samples") to sequence it. Rolls, chance, length, the mixer and EXPORT WAV all work with it. A new hit chokes the previous one on the same pad.
+  - Share links point to sample slots but don't carry the audio; the receiver hears their own samples or nothing. CLEAR has an undo toast.
+  - **iPhone:** recording works in Safari (iOS 14.5+) after you allow the microphone. The mic is released as soon as you stop. If a browser can't record, REC is hidden and LOAD still works.
+- **MIDI input:** press **MIDI** to connect keyboards and pad controllers (Web MIDI). Channel 10 plays the drum tracks using the General MIDI map (36 kick, 38 snare, 39 clap, 42 closed hat, 46 open hat, everything else Perc). Other channels play the synth with velocity. Devices can be plugged in later. iPhone and iPad Safari don't support Web MIDI, so the button is disabled there with an explanation.
 
 ### Keyboard and screen readers
 Steps are toggle buttons with `aria-pressed` and labels such as "Kick step 5, velocity 80%, roll ×3, 50% chance". The grid uses a single tab stop: arrow keys move, Home/End jump, Enter or Space toggles, and Shift+Enter cycles velocity. Mouse and touch taps don't take keyboard focus, so Space still means PLAY.
@@ -78,13 +102,13 @@ Then visit `http://localhost:4173`. Tap or click once to start audio — phones,
 npm test
 ```
 
-`npm test` covers the music engine, share-link roundtrips (v2, plus real v1 links from the previous release), input sanitizing, the undo stack, tap tempo, recording-format selection, the WAV encoder (header, length, sample values), the export schedule (ratchets, chance, song chain), AI reply extraction and validation, the AI rate limiter, and the service worker's file list. It also runs an **offline-render loudness regression** (`test/loudness.test.mjs`): worst-case beats (every track on every step, ×6 rolls, all sends maxed, hard pans, 808 slides, volume 1, limiter off) are rendered through the real export graph with `node-web-audio-api` and must stay below −1 dBFS. Run `npm install` first to get it. Without it those tests are skipped.
+`npm test` covers the music engine, share-link roundtrips (v2, plus real v1 links from the previous release), input sanitizing, the undo stack, tap tempo, recording-format selection, the WAV encoder (header, length, sample values), the export schedule (ratchets, chance, song chain), AI reply extraction and validation, the AI rate limiter, and the service worker's file list. It also runs an **offline-render loudness regression** (`test/loudness.test.mjs`): worst-case beats (every track on every step, ×6 rolls, all sends maxed, hard pans, 808 slides, volume 1, limiter off) are rendered through the real export graph with `node-web-audio-api` and must stay below −1 dBFS. Run `npm install` first to get it. Without it those tests are skipped. `test/classics.test.mjs` checks the trap sections (145 BPM, chain, gliding 808, half-time snare, rolls into every snare and bar end), renders every section at default and maxed mixer levels, with TAPE and polymetric layer loops, below −1.2 dBFS, and counts one audible onset per roll hit in a render. `test/loopers.test.mjs` covers the section loopers (layering in sync, bar-line starts, ½/1/2-bar lengths, export of exactly the playing sections, the retired ATLANTA NIGHT starter, and all four sections layered at max levels, with and without TAPE, below −1.2 dBFS). `test/rolls-deck.test.mjs` covers roll shapes, velocity/pitch ramps, old links staying byte-identical, ramp round trips and bad-byte rejection, and the per-layer loop maths.
 
 ```bash
 npm run test:e2e
 ```
 
-This runs a browser end-to-end test with `puppeteer-core` against a local server. It checks iPhone layout, banks and song mode, step settings, the mixer, keyboard grid navigation, and v1 + v2 share links. It needs Chrome or Chromium; set `CHROME_PATH` if it isn't in a standard place. Without a browser it skips.
+This runs a browser end-to-end test with `puppeteer-core` against a local server. It checks iPhone layout, the classic 808 trap sections (defaults only on an empty session, each section's own ▶ PLAY playing only that section, STOP ALL never starting sound, Space playing the selected section, layering a second section at the next bar, per-section loop length, the old ATLANTA NIGHT save being replaced, bar-line queueing, song chain order, loop ↔ song without stopping), the tape deck (a ½-bar hat loop under the full beat, STOP / REWIND landing on bar lines, ALL IN SYNC, reels only turning while playing, TAPE on, 390 px fit), banks and song mode, step settings, the mixer, keyboard grid navigation, and v1 + v2 share links. It needs Chrome or Chromium; set `CHROME_PATH` if it isn't in a standard place. Without a browser it skips.
 
 It needs no API key. Fonts are self-hosted (SIL OFL, see `fonts/`), so it works fully offline. The optional AI beat writer calls `https://amienigma-llm.vercel.app/api/chat`.
 

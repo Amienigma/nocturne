@@ -35,7 +35,6 @@ import {
   REL_MAX,
   cycleStepVelocity,
   setStepProps,
-  emptyPattern,
 } from "./src/music.mjs";
 import {
   serializeState,
@@ -54,10 +53,15 @@ import {
   withPatternAlias,
   snapshotOf,
   stateFromSnapshot,
+  pickRecordType,
   toStored,
   fromStored,
 } from "./src/state-io.mjs";
-import { stepHits, bankForLoop } from "./src/sequencer.mjs";
+import { layerHits, sanitizeLayers } from "./src/sequencer.mjs";
+import { defaultLoopers, sanitizeLoopers, looperStep, looperHits, activeLoopers, applyLooperQueue, SECTION_LENS, SECTION_LEN_LABELS } from "./src/loopers.mjs";
+import { classicBanks, classicMixer, classicState, isLegacyStarter, CLASSIC_BPM, CLASSIC_SWING, CLASSIC_LENGTH, CLASSIC_CHAIN, CLASSIC_SECTIONS } from "./src/classics.mjs";
+import { SAMPLE_SLOTS, MAX_FILE_BYTES, MAX_SAMPLE_SEC, prepareSample, loadSamples, saveSample, deleteSample } from "./src/samples.mjs";
+import { midiSupported, connectMidi, drumTrackForNote } from "./src/midi.mjs";
 import { renderWav, EXPORT_BARS } from "./src/export.mjs";
 import { AI_ENDPOINT, buildBeatPrompt, extractJson, beatFromAi, RateLimiter } from "./src/beat-ai.mjs";
 
@@ -68,18 +72,20 @@ const state = withPatternAlias({
   hitBank: "atlanta",
   armed: false,
   playing: false,
-  bpm: 100,
-  swing: 0,
-  length: 16,
-  // Pattern banks A–D; `state.pattern` is an alias for banks[bank].
-  banks: [applyPreset("ATLANTA NIGHT"), emptyPattern(32), emptyPattern(32), emptyPattern(32)],
+  bpm: CLASSIC_BPM,
+  swing: CLASSIC_SWING,
+  length: CLASSIC_LENGTH,
+  // Pattern banks A–D; `state.pattern` is an alias for banks[bank]. A fresh
+  // session (no autosave, no share link) starts with four classic TR-808
+  // sections; saved beats replace them in loadAutosave() / share links.
+  banks: classicBanks(),
   bank: 0,
-  chain: [0],
+  chain: [...CLASSIC_CHAIN],
   song: false,
-  mixer: TRACKS.map(defaultMix),
-  focusStep: { t: 6, s: 0 },
-  preset: "ATLANTA NIGHT",
-  selectedTrack: 6,
+  mixer: classicMixer(),
+  focusStep: { t: 0, s: 0 },
+  preset: null,
+  selectedTrack: 0,
   paintNote: 36,
   paintChord: "cm",
   hatDiv: "1/16",
@@ -93,7 +99,10 @@ const state = withPatternAlias({
   soundBank: "Memphis",
   active: [],
   metronome: defaultMetronome(),
+  tape: false,
 });
+// Tape-deck layer transports (one per track); see the "Tape deck" section.
+let layers = sanitizeLayers(null, TRACKS.length);
 
 const $ = (id) => document.getElementById(id);
 window.__nocturneState = state; // for tests/debugging
@@ -138,7 +147,9 @@ function applyState(raw, { keepMetronome = false, keepPatch = false } = {}) {
   state.chain = s.chain;
   state.song = s.song;
   state.mixer = s.mixer;
-  queuedBank = null;
+  looperQueue.clear();
+  for (const l of loopers) l.on = false;
+  queuedMode = null;
   if (!keepMetronome) state.metronome = s.metronome;
   studio.setPatch(state.patch);
   studio.setLimiter(state.limiter);
@@ -245,13 +256,36 @@ function saveNow() {
   clearTimeout(autosaveTimer);
   autosaveTimer = 0;
   try {
-    store()?.setItem(AUTOSAVE_KEY, JSON.stringify(toStored(state)));
+    // Optional extras next to the packed beat (older builds ignore them):
+    // TAPE on/off, each layer's loop window and each section looper's length.
+    const extra = { tape: state.tape, layers: layers.map(({ start, end }) => ({ start, end })), secLens: loopers.map((l) => l.len) };
+    store()?.setItem(AUTOSAVE_KEY, JSON.stringify({ ...toStored(state), ...extra }));
   } catch { /* storage full or blocked: keep playing */ }
 }
 
+let legacyReplaced = false;
 function loadAutosave() {
   const raw = store()?.getItem(AUTOSAVE_KEY);
-  return raw ? applyState(raw) : false;
+  if (!raw) return false;
+  const ok = applyState(raw);
+  // The old build opened on the ATLANTA NIGHT preset. A save that is still
+  // exactly that untouched starter (nothing edited) isn't the user's beat, so
+  // the trap sections replace it instead of PLAY bringing the old preset back.
+  if (ok && isLegacyStarter(state)) {
+    applyState(classicState(), { keepMetronome: true, keepPatch: true });
+    legacyReplaced = true;
+    saveNow();
+    return false;
+  }
+  const extra = ok ? safeParse(raw) : null;
+  if (extra && typeof extra === "object") {
+    if (Array.isArray(extra.secLens)) loopers = sanitizeLoopers(extra.secLens, PATTERN_BANKS);
+    if (Array.isArray(extra.layers)) layers = sanitizeLayers(extra.layers.map((l) => ({ ...l, mode: "play" })), TRACKS.length);
+    state.tape = extra.tape === true;
+    studio.setTape(state.tape);
+    renderDeck();
+  }
+  return ok;
 }
 
 function readSlots() {
@@ -429,8 +463,12 @@ async function exportWav() {
     const snap = serializeState(state);
     const res = await renderWav(snap, {
       bars,
+      samples: sampleRecs,
       bitDepth,
       masterGain: Number($("vol").value),
+      tape: state.tape,
+      layers: exportLayers(),
+      loopers: exportLoopers(),
       onProgress: (p) => { prog.value = p; status.textContent = `Rendering… ${Math.round(p * 100)}%`; },
     });
     window.__lastExport = res; // for tests/debugging
@@ -864,7 +902,10 @@ function renderPaint() {
       btn.textContent = noteName(midi);
       btn.addEventListener("click", () => {
         state.paintNote = midi;
-        if (arm()) studio.firePit(midi, studio.ctx.currentTime, 0.8, pitWaveFromSource(source) || state.patch.wave, 0.25);
+        if (arm()) {
+          if (source === "tr:TOM") studio.play808("TOM", studio.ctx.currentTime, 0.8, midi);
+          else studio.firePit(midi, studio.ctx.currentTime, 0.8, pitWaveFromSource(source) || state.patch.wave, 0.25);
+        }
         renderPaint();
       });
       root.appendChild(btn);
@@ -883,6 +924,7 @@ const focusQuery = window.matchMedia("(max-width: 600px)");
 const isFocusView = () => focusQuery.matches;
 
 function sourceLabel(id) {
+  if (/^smp:\d$/.test(id)) return sampleLabel(Number(id.slice(4)));
   for (const group of SOURCE_GROUPS) {
     const item = group.items.find((x) => x.id === id);
     if (item) return item.label;
@@ -908,7 +950,7 @@ function updateCell(track, step) {
   btn.style.setProperty("--vel", String(cell.vel));
   btn.setAttribute("aria-pressed", String(cell.on));
   const extras = cellExtras(cell);
-  if (cell.on && cell.rat > 1) btn.dataset.rat = String(cell.rat);
+  if (cell.on && cell.rat !== 1) btn.dataset.rat = String(cell.rat);
   else delete btn.dataset.rat;
   btn.classList.toggle("prob", cell.on && cell.prob < 1);
   btn.classList.toggle("slide", cell.on && cell.slide);
@@ -920,7 +962,8 @@ function updateCell(track, step) {
 
 function cellExtras(cell) {
   let out = "";
-  if (cell.rat > 1) out += `, roll ×${cell.rat}`;
+  if (cell.rat !== 1) out += `, roll ${cell.rat >= 2 ? `×${cell.rat}` : cell.rat === 1.5 ? "1/24 triplet" : "1/12 triplet"}`;
+  if (cell.ramp) out += `, ramp ${["", "louder", "softer", "pitch up", "pitch down", "louder + pitch up", "softer + pitch down"][cell.ramp] || ""}`;
   if (cell.prob < 1) out += `, ${Math.round(cell.prob * 100)}% chance`;
   if (cell.slide) out += ", slide";
   if (cell.gate > 0) out += `, length ${cell.gate} step${cell.gate === 1 ? "" : "s"}`;
@@ -1224,8 +1267,20 @@ let timer = 0;
 let nextTime = 0;
 let stepIndex = 0;
 let absStep = 0; // steps since PLAY, for bar-accurate metronome accents
-let loopCount = 0; // pattern loops since PLAY (song position)
-let queuedBank = null; // bank picked while playing; starts at the next loop
+let songPos = 0; // index into state.chain while the song plays
+// Section loopers: one per section (A–D), each with its own PLAY / STOP and
+// loop length. Several can play at once, layered on the one clock.
+let loopers = defaultLoopers(PATTERN_BANKS);
+const looperQueue = new Map(); // bank -> { on, len? }: applied at the next bar line
+let queuedMode = null; // "song" | "loop": mode switch waiting for the next bar
+const BAR_STEPS = 16;
+// Last few section switches ({ step, bank, song, why }), for tests/debugging.
+const transportLog = [];
+function logSwitch(bank, why) {
+  transportLog.push({ step: absStep, bank, song: state.song, why });
+  if (transportLog.length > 64) transportLog.shift();
+}
+window.__nocturneTransport = () => ({ layers: layers.map((l) => ({ ...l })), layerQueue: [...layerQueue.keys()], syncQueued, playing: state.playing, absStep, stepIndex, songPos, loopers: loopers.map((l) => ({ ...l })), looperQueue: [...looperQueue].map(([bank, op]) => ({ bank, ...op })), queuedMode, bank: state.bank, song: state.song, log: transportLog.slice() });
 const lightTimers = new Set();
 
 function outputDelay() {
@@ -1267,11 +1322,36 @@ function scheduler() {
   if (!state.playing || !studio.ctx) return;
   const stepSec = 60 / state.bpm / 4;
   while (nextTime < studio.ctx.currentTime + 0.12) {
-    const step = stepIndex % state.length;
-    const swing = step % 2 === 1 ? (state.swing / 100) * stepSec * 0.5 : 0;
+    if (absStep > 0) {
+      const bar = absStep % BAR_STEPS === 0;
+      // Section / mode changes land on the next bar line (every 16 steps), so
+      // everything stays in time; the new section starts from its step 1.
+      if (bar && (looperQueue.size || queuedMode)) {
+        applyQueued(nextTime);
+        stepIndex = 0;
+        if (!state.song && !activeLoopers(loopers).length) {
+          setPlaying(false);
+          return;
+        }
+      } else if (stepIndex === 0 && state.song) {
+        advanceSong(nextTime);
+      }
+      // Tape-deck layer changes (play / loop / stop / rewind / sync) also wait for the bar line.
+      if (bar && (layerQueue.size || syncQueued)) {
+        if (syncQueued) stepIndex = 0;
+        applyLayerQueue(nextTime);
+      }
+      if (bar && deckOpen()) queueUi(nextTime, renderCounters);
+      if (bar && !state.song) queueUi(nextTime, renderLooperLive);
+    }
+    // Song: the chain's current section. Otherwise every playing section looper,
+    // layered; the grid's playhead follows the section you're editing.
+    const sel = loopers[state.bank];
+    const step = state.song ? stepIndex % state.length : sel?.on ? looperStep(sel, absStep, state.length) : -1;
+    const swing = absStep % 2 === 1 ? (state.swing / 100) * stepSec * 0.5 : 0;
     const when = nextTime + swing;
-    if (step === 0 && absStep > 0) loopBoundary(nextTime);
-    for (const h of stepHits(state.pattern, step, stepSec)) {
+    const hits = state.song ? layerHits(state.pattern, layers, absStep, step, stepSec) : looperHits(state.banks, loopers, layers, absStep, stepSec, state.length);
+    for (const h of hits) {
       studio.triggerSource(h.source, h.cell, when + h.at, h.vel, h.opts);
     }
     queueLight(step, when);
@@ -1291,7 +1371,8 @@ function scheduler() {
 function setPlaying(on, startAt = null) {
   if (on && !arm()) return;
   state.playing = on;
-  $("play").textContent = on ? "STOP" : "PLAY";
+  // The top-bar button only stops: sound starts from a section's own ▶ PLAY (or SONG).
+  $("play").disabled = !on;
   $("play").classList.toggle("on", on);
   if (timer) {
     clearInterval(timer);
@@ -1303,10 +1384,24 @@ function setPlaying(on, startAt = null) {
     if (startAt == null) nextTime = studio.ctx.currentTime + 0.05;
     stepIndex = 0;
     absStep = 0;
-    loopCount = 0;
-    if (state.song) switchBank(bankForLoop(state, 0));
-    else if (queuedBank != null) switchBank(queuedBank);
-    queuedBank = null;
+    songPos = 0;
+    transportLog.length = 0;
+    for (const l of layers) l.origin = 0;
+    for (const [t, q] of layerQueue) applyLayerOp(t, q, 0);
+    layerQueue.clear();
+    syncQueued = false;
+    if (state.song && state.chain.length) {
+      for (const l of loopers) l.on = false;
+      switchBank(state.chain[0]);
+    } else {
+      state.song = false;
+      for (const [b, op] of looperQueue) if (op.on !== false && loopers[b]) loopers[b].on = true;
+      // Started by REC's count-in, Space or the tape deck: the section you're on.
+      if (!activeLoopers(loopers).length) loopers[state.bank].on = true;
+      for (const l of loopers) l.origin = 0;
+    }
+    looperQueue.clear();
+    queuedMode = null;
     renderBanks();
     timer = window.setInterval(scheduler, 25);
     kickScope();
@@ -1314,12 +1409,16 @@ function setPlaying(on, startAt = null) {
     // Just move the playhead off; no need to rebuild the whole grid.
     clearLights();
     state.currentStep = -1;
-    queuedBank = null;
+    looperQueue.clear();
+    for (const l of loopers) l.on = false;
+    queuedMode = null;
     renderBanks();
+    renderDeck();
     // The AudioContext suspends itself once tails have rung out (studio idle check).
     studio.lastUse = performance.now();
   }
   renderLcd();
+  if (on) renderDeck();
 }
 
 // ---- Step focus + inspector (velocity, roll, chance, length, slide) ----
@@ -1337,20 +1436,21 @@ function renderInspector() {
   const row = state.pattern[t];
   const cell = row?.steps[s];
   if (!cell) return;
-  const melodic = sourceIsMelodic(row.source) && !sourceIsChord(row.source);
+  const melodic = sourceIsMelodic(row.source) && !sourceIsChord(row.source) && !row.source.startsWith("tr:");
   $("insp-title").textContent = `${TRACKS[t].toUpperCase()} · STEP ${s + 1}${cell.on ? "" : " (off)"}`;
   $("insp").classList.toggle("off", !cell.on);
   $("insp-vel").value = String(cell.vel);
   $("insp-vel-val").textContent = `${Math.round(cell.vel * 100)}%`;
   $("insp-rat").value = String(cell.rat);
   $("insp-prob").value = String(cell.prob);
+  $("insp-ramp").value = String(cell.ramp || 0);
   $("insp-gate").value = String(cell.gate);
   const slide = $("insp-slide");
   slide.classList.toggle("on", cell.slide);
   slide.setAttribute("aria-pressed", String(cell.slide));
   slide.disabled = !melodic;
   slide.title = melodic ? "Glide from the previous note on this track" : "Slide works on 808 / synth tracks";
-  for (const id of ["insp-vel", "insp-rat", "insp-prob", "insp-gate"]) $(id).disabled = !cell.on;
+  for (const id of ["insp-vel", "insp-rat", "insp-prob", "insp-gate", "insp-ramp"]) $(id).disabled = !cell.on;
   if (!cell.on) slide.disabled = true;
 }
 
@@ -1372,6 +1472,7 @@ function initInspector() {
   vel.addEventListener("change", endEdit);
   $("insp-rat").addEventListener("change", (e) => editFocused({ rat: Number(e.target.value) }));
   $("insp-prob").addEventListener("change", (e) => editFocused({ prob: Number(e.target.value) }));
+  $("insp-ramp").addEventListener("change", (e) => editFocused({ ramp: Number(e.target.value) }));
   $("insp-gate").addEventListener("change", (e) => editFocused({ gate: Number(e.target.value) }));
   $("insp-slide").addEventListener("click", () => {
     const { t, s } = state.focusStep;
@@ -1379,7 +1480,10 @@ function initInspector() {
   });
 }
 
-// ---- Pattern banks A–D and song chain ----
+// ---- Sections (pattern banks A–D), solo loops and the song chain ----
+// Each section has its own looper (▶ PLAY; several can layer) or the chain plays them in order
+// (▶ SONG). While playing, any switch (section → section, loop ↔ song) is
+// queued to the next bar line so the groove never drops a beat.
 let bankClipboard = null;
 
 function switchBank(b) {
@@ -1391,34 +1495,139 @@ function switchBank(b) {
   scheduleAutosave();
 }
 
-function pickBank(b) {
-  if (state.playing && !state.song) {
-    queuedBank = b === state.bank ? null : b;
-    renderBanks();
-    return;
-  }
-  switchBank(b);
-}
-
-// Called by the scheduler when a pattern loop wraps (at audio time `when`).
-function loopBoundary(when) {
-  loopCount += 1;
-  let next = null;
-  if (state.song) next = bankForLoop(state, loopCount);
-  else if (queuedBank != null) next = queuedBank;
-  queuedBank = null;
+/** Point playback at bank `next` from audio time `when`; the grid follows when it's heard. */
+function setAudioBank(next, when) {
   if (next == null || next === state.bank) {
-    if (state.song) queueUi(when, renderBanks);
+    queueUi(when, renderBanks);
     return;
   }
-  // The audio switches now (the scheduler reads state.pattern); the grid
-  // follows when the new loop is actually heard.
   state.bank = next;
   queueUi(when, () => {
     renderSeq();
     renderInspector();
     renderBanks();
   });
+}
+
+// Called by the scheduler on a bar line with something queued.
+function applyQueued(when) {
+  if (queuedMode === "song") {
+    state.song = true;
+    songPos = 0;
+    for (const l of loopers) l.on = false;
+    looperQueue.clear();
+    queuedMode = null;
+    const next = state.chain.length ? state.chain[0] : state.bank;
+    logSwitch(next, "bar");
+    setAudioBank(next, when);
+  } else {
+    if (queuedMode === "loop") {
+      state.song = false;
+      for (const l of loopers) l.on = false;
+    }
+    queuedMode = null;
+    const changes = [...looperQueue];
+    applyLooperQueue(loopers, looperQueue, absStep);
+    for (const [b, op] of changes) logSwitch(b, op.on === false ? "looper-off" : "looper");
+    queueUi(when, renderBanks);
+  }
+  scheduleAutosave();
+}
+
+// Called by the scheduler when the pattern wraps in song mode.
+function advanceSong(when) {
+  if (!state.chain.length) return;
+  songPos = (songPos + 1) % state.chain.length;
+  logSwitch(state.chain[songPos], "song");
+  setAudioBank(state.chain[songPos], when);
+}
+
+/**
+ * A section's own ▶ PLAY. Stopped: start just that section's looper.
+ * Playing: a stopped section joins in sync at the next bar (layered on top),
+ * a playing one stops right away (the last one stops the beat), and a section
+ * that's waiting for the bar line is cancelled by a second tap.
+ */
+function sectionPlay(b) {
+  if (b < 0 || b >= PATTERN_BANKS) return;
+  if (!state.playing) {
+    cancelCountIn();
+    if (state.song) commit(() => { state.song = false; });
+    looperQueue.clear();
+    for (const l of loopers) l.on = false;
+    loopers[b].on = true;
+    switchBank(b);
+    setPlaying(true);
+    return;
+  }
+  if (state.song) {
+    if (looperQueue.has(b)) looperQueue.delete(b);
+    else looperQueue.set(b, { on: true });
+    queuedMode = looperQueue.size ? "loop" : null;
+    renderBanks();
+    return;
+  }
+  if (loopers[b].on) {
+    loopers[b].on = false;
+    looperQueue.delete(b);
+    logSwitch(b, "looper-off");
+    if (!activeLoopers(loopers).length) {
+      setPlaying(false);
+      return;
+    }
+  } else if (looperQueue.has(b)) {
+    looperQueue.delete(b);
+  } else {
+    looperQueue.set(b, { on: true });
+  }
+  renderBanks();
+}
+
+/** A section looper's length (½, 1 or 2 bars). A playing looper restarts with it at the next bar. */
+function setLooperLen(b, len) {
+  if (!SECTION_LENS.includes(len) || !loopers[b]) return;
+  if (state.playing && !state.song && loopers[b].on) looperQueue.set(b, { on: true, len });
+  else loopers[b].len = len;
+  scheduleAutosave();
+  renderBanks();
+}
+
+/** ▶ SONG: play the chain, switch to it at the next bar, or stop it. */
+function songButton() {
+  if (!state.chain.length) {
+    showSnack("The song is empty: tap +A, +B, +C or +D to add sections");
+    return;
+  }
+  if (!state.playing) {
+    cancelCountIn();
+    if (!state.song) commit(() => { state.song = true; });
+    setPlaying(true);
+    return;
+  }
+  if (queuedMode === "song") {
+    queuedMode = null; // tapped again before the bar: cancel
+  } else if (state.song) {
+    if (queuedMode === "loop") {
+      queuedMode = null;
+      looperQueue.clear();
+    } else {
+      setPlaying(false);
+      return;
+    }
+  } else {
+    queuedMode = "song";
+    looperQueue.clear();
+  }
+  renderBanks();
+}
+
+/** The section letter only picks which section you edit; sound comes from ▶ PLAY. */
+function pickBank(b) {
+  if (state.playing && state.song) {
+    showSnack("The song is playing: it moves through the chain. Tap ▶ PLAY on a section to loop it instead");
+    return;
+  }
+  switchBank(b);
 }
 
 function queueUi(when, fn) {
@@ -1430,33 +1639,91 @@ function queueUi(when, fn) {
   lightTimers.add(id);
 }
 
+// Section labels: the classic name while a bank still holds its classic
+// groove. Cached per pattern object (patterns are replaced on every edit).
+const sectionLabels = new WeakMap();
+let classicSigs = null;
+function sectionLabel(b) {
+  const p = state.banks[b];
+  if (!p) return "";
+  let label = sectionLabels.get(p);
+  if (label == null) {
+    classicSigs ??= classicBanks().map((x) => JSON.stringify(x));
+    const empty = p.every((row) => row.steps.every((c) => !c.on));
+    label = empty ? "empty" : JSON.stringify(p) === classicSigs[b] ? CLASSIC_SECTIONS[b].name : "edited";
+    sectionLabels.set(p, label);
+  }
+  return label;
+}
+
 function renderBanks() {
+  const playing = state.playing;
   document.querySelectorAll("[data-pbank]").forEach((el) => {
     const b = Number(el.dataset.pbank);
     el.classList.toggle("on", b === state.bank);
-    el.classList.toggle("queued", b === queuedBank);
     el.setAttribute("aria-pressed", String(b === state.bank));
   });
-  $("song").classList.toggle("on", state.song);
-  $("song").setAttribute("aria-pressed", String(state.song));
+  const songPlaying = playing && state.song;
+  document.querySelectorAll("[data-loop]").forEach((el) => {
+    const b = Number(el.dataset.loop);
+    const l = loopers[b];
+    const on = playing && !state.song && l.on;
+    const q = looperQueue.get(b);
+    const queued = Boolean(q) && !on;
+    const N = BANK_NAMES[b];
+    el.classList.toggle("on", on);
+    el.classList.toggle("queued", queued);
+    el.setAttribute("aria-pressed", String(on));
+    el.textContent = on ? "■ STOP" : queued ? "◷ NEXT BAR" : "▶ PLAY";
+    el.setAttribute("aria-label", on ? `Stop section ${N}` : queued ? `Section ${N} starts at the next bar; tap to cancel` : `Play section ${N}${playing ? " in sync from the next bar" : ""}`);
+    const card = el.closest(".sec");
+    if (!card) return;
+    card.classList.toggle("playing", on || (songPlaying && b === state.bank));
+    card.classList.toggle("editing", b === state.bank);
+    const name = card.querySelector(".sec-name");
+    if (name) name.textContent = sectionLabel(b);
+    const len = card.querySelector("[data-seclen]");
+    if (len) len.value = String(q?.len ?? l.len);
+  });
+  renderLooperLive();
+  const songBtn = $("song");
+  songBtn.classList.toggle("on", state.song);
+  songBtn.classList.toggle("queued", queuedMode === "song");
+  songBtn.setAttribute("aria-pressed", String(state.song));
+  songBtn.textContent = songPlaying && queuedMode !== "loop" ? "■ SONG" : queuedMode === "song" ? "◷ SONG" : "▶ SONG";
+  songBtn.setAttribute("aria-label", songPlaying ? "Stop the song" : playing ? "Play the song from the next bar" : "Play the song (sections in chain order, looping)");
+  songBtn.disabled = !state.chain.length;
   $("bank-paste").disabled = !bankClipboard;
   const chain = $("chain");
   chain.innerHTML = "";
-  const pos = state.playing && state.song ? loopCount % state.chain.length : -1;
+  const pos = songPlaying && state.chain.length ? songPos % state.chain.length : -1;
   state.chain.forEach((b, i) => {
     const chip = document.createElement("button");
     chip.type = "button";
     chip.className = `mini${i === pos ? " now" : ""}`;
     chip.textContent = BANK_NAMES[b];
     chip.dataset.ci = String(i);
-    chip.setAttribute("aria-label", `Song part ${i + 1}: bank ${BANK_NAMES[b]}. Activate to change`);
+    chip.setAttribute("aria-label", `Song part ${i + 1} of ${state.chain.length}: section ${BANK_NAMES[b]}${i === pos ? ", playing" : ""}. Activate to change`);
     chain.appendChild(chip);
   });
-  $("chain-add").disabled = state.chain.length >= CHAIN_MAX;
-  $("chain-del").disabled = state.chain.length <= 1;
-  $("bank-status").textContent = queuedBank != null
-    ? `Bank ${BANK_NAMES[queuedBank]} starts next loop`
-    : state.song ? `Song: ${state.chain.length} part${state.chain.length === 1 ? "" : "s"}` : "";
+  if (!state.chain.length) {
+    const empty = document.createElement("span");
+    empty.className = "hint";
+    empty.textContent = "empty: tap +A–D";
+    chain.appendChild(empty);
+  }
+  document.querySelectorAll("[data-append]").forEach((el) => { el.disabled = state.chain.length >= CHAIN_MAX; });
+  $("chain-del").disabled = state.chain.length === 0;
+  $("chain-clear").disabled = state.chain.length === 0;
+  let status = "";
+  const act = activeLoopers(loopers).map((b) => BANK_NAMES[b]);
+  const joining = [...looperQueue].filter(([b, op]) => op.on !== false && !loopers[b].on).map(([b]) => BANK_NAMES[b]);
+  if (queuedMode === "song") status = "Song starts at the next bar";
+  else if (queuedMode === "loop") status = `Section ${joining.join(" + ")} loops from the next bar`;
+  else if (songPlaying) status = `Song: part ${pos + 1} of ${state.chain.length} (loops)`;
+  else if (playing) status = `Playing section ${act.join(" + ")}${act.length > 1 ? " (layered, in sync)" : ""}${joining.length ? `; ${joining.join(" + ")} joins at the next bar` : ""}`;
+  else if (state.song) status = `Song: ${state.chain.length} part${state.chain.length === 1 ? "" : "s"}`;
+  $("bank-status").textContent = status;
   const bars = $("exp-bars");
   if (bars) {
     bars.disabled = state.song;
@@ -1464,46 +1731,307 @@ function renderBanks() {
   }
 }
 
+// Live indicator on each section card: which bar of its loop it's on. Updated
+// once per bar (scheduler) and on changes; no animation loop.
+function renderLooperLive() {
+  const playing = state.playing;
+  document.querySelectorAll(".sec .sec-live").forEach((el) => {
+    const b = Number(el.dataset.live);
+    const l = loopers[b];
+    const on = playing && !state.song && l.on;
+    let text = "stopped";
+    if (on) {
+      const len = Math.min(l.len, state.length);
+      text = len < 16 ? "● ½-bar loop" : `● bar ${Math.floor(looperStep(l, Math.max(0, absStep - 1), state.length) / 16) + 1}/${len / 16}`;
+    } else if (looperQueue.has(b)) text = "◷ joining";
+    else if (playing && state.song && b === state.bank) text = "● in song";
+    el.textContent = text;
+  });
+}
+
+/** What EXPORT WAV renders outside song mode: the playing section loopers (else the section you're on). */
+function exportLoopers() {
+  if (state.song || !state.playing || !activeLoopers(loopers).length) return null;
+  return loopers.map((l) => ({ ...l, origin: 0 }));
+}
+
+function setChain(next) {
+  commit(() => { state.chain = next; });
+  if (songPos >= next.length) songPos = 0;
+  renderBanks();
+}
+
+function loadClassics() {
+  commit(() => applyState(classicState(), { keepMetronome: true, keepPatch: true }), "Loaded the classic 808 sections");
+  saveNow();
+}
+
 function initBanks() {
   document.querySelectorAll("[data-pbank]").forEach((el) => {
     el.addEventListener("click", () => pickBank(Number(el.dataset.pbank)));
   });
+  document.querySelectorAll("[data-loop]").forEach((el) => {
+    el.addEventListener("click", () => sectionPlay(Number(el.dataset.loop)));
+  });
+  document.querySelectorAll("[data-seclen]").forEach((el) => {
+    el.addEventListener("change", () => setLooperLen(Number(el.dataset.seclen), Number(el.value)));
+  });
   $("bank-copy").addEventListener("click", () => {
     bankClipboard = JSON.parse(JSON.stringify(state.pattern));
     renderBanks();
-    showSnack(`Bank ${BANK_NAMES[state.bank]} copied`);
+    showSnack(`Section ${BANK_NAMES[state.bank]} copied`);
   });
   $("bank-paste").addEventListener("click", () => {
     if (!bankClipboard) return;
     const copy = JSON.parse(JSON.stringify(bankClipboard));
-    commit(() => { state.pattern = copy; }, `Pasted into bank ${BANK_NAMES[state.bank]}`);
+    commit(() => { state.pattern = copy; }, `Pasted into section ${BANK_NAMES[state.bank]}`);
     renderSeq();
     renderInspector();
-  });
-  $("song").addEventListener("click", () => {
-    commit(() => { state.song = !state.song; });
-    if (state.song && state.playing) queuedBank = null;
     renderBanks();
   });
+  $("song").addEventListener("click", songButton);
   $("chain").addEventListener("click", (e) => {
     const chip = e.target.closest?.("[data-ci]");
     if (!chip) return;
     const i = Number(chip.dataset.ci);
-    commit(() => {
-      state.chain = state.chain.map((b, j) => (j === i ? (b + 1) % PATTERN_BANKS : b));
-    });
-    renderBanks();
+    setChain(state.chain.map((b, j) => (j === i ? (b + 1) % PATTERN_BANKS : b)));
   });
-  $("chain-add").addEventListener("click", () => {
-    if (state.chain.length >= CHAIN_MAX) return;
-    commit(() => { state.chain = [...state.chain, state.bank]; });
-    renderBanks();
+  document.querySelectorAll("[data-append]").forEach((el) => {
+    el.addEventListener("click", () => {
+      if (state.chain.length >= CHAIN_MAX) return;
+      setChain([...state.chain, Number(el.dataset.append)]);
+    });
   });
   $("chain-del").addEventListener("click", () => {
-    if (state.chain.length <= 1) return;
-    commit(() => { state.chain = state.chain.slice(0, -1); });
-    renderBanks();
+    if (!state.chain.length) return;
+    setChain(state.chain.slice(0, -1));
   });
+  $("chain-clear").addEventListener("click", () => {
+    setChain([]);
+    showSnack("Song cleared: tap +A, +B, +C, +D to build it", true);
+  });
+  $("classic-load").addEventListener("click", loadClassics);
+}
+
+// ---- Tape deck: a cassette transport per layer (track) ----
+// ▶ PLAY: the layer plays in sync with the beat. ⟲ LOOP: it loops its own
+// window (¼ bar … 2 bars, or custom steps) on the global clock, so layers of
+// different lengths run polymetrically. ■ STOP: silent. ◀◀ REW: back to the
+// top of its loop. While the beat plays, every change lands on the next bar
+// line (like section switches). ▶ ALL puts every layer back in sync at the
+// next bar. Reels spin with CSS (no rAF) and only while a layer rolls; the tape
+// counters update once per bar, and only while the deck panel is open.
+const layerQueue = new Map(); // track -> { mode?, rew? }
+let syncQueued = false;
+const LOOP_WINDOWS = [
+  { id: "4", label: "¼ bar", start: 0, end: 4 },
+  { id: "8", label: "½ bar", start: 0, end: 8 },
+  { id: "16", label: "1 bar", start: 0, end: 16 },
+  { id: "32", label: "2 bars", start: 0, end: 32 },
+];
+let deckRows = [];
+const deckOpen = () => Boolean($("deck-panel")?.open);
+
+function applyLayerOp(t, q, at) {
+  const l = layers[t];
+  if (q.mode === "play" || q.mode === "stop") l.mode = q.mode;
+  if (q.mode === "loop" && l.mode !== "loop") {
+    l.mode = "loop";
+    l.origin = at;
+  }
+  if (q.rew) {
+    if (l.mode === "play") l.mode = "loop";
+    l.origin = at;
+  }
+}
+
+function applyLayerQueue(when) {
+  if (syncQueued) {
+    for (const l of layers) {
+      l.mode = "play";
+      l.origin = absStep;
+    }
+    logSwitch(state.bank, "sync");
+  }
+  for (const [t, q] of layerQueue) applyLayerOp(t, q, absStep);
+  if (layerQueue.size) logSwitch(state.bank, "layers");
+  layerQueue.clear();
+  syncQueued = false;
+  queueUi(when, renderDeck);
+}
+
+/** A deck button on layer `t`: "play" | "loop" | "stop" | "rew". */
+function layerAction(t, action) {
+  const q = action === "rew" ? { rew: true } : { mode: action };
+  if (!state.playing) {
+    applyLayerOp(t, q, 0);
+    if (action === "play" || action === "loop") {
+      cancelCountIn();
+      setPlaying(true);
+    }
+    renderDeck();
+    return;
+  }
+  const prev = layerQueue.get(t) || {};
+  layerQueue.set(t, action === "rew" ? { ...prev, rew: true } : { ...prev, mode: action });
+  renderDeckRow(t);
+}
+
+function syncAll() {
+  if (!state.playing) {
+    for (const l of layers) { l.mode = "play"; l.origin = 0; }
+    layerQueue.clear();
+    cancelCountIn();
+    setPlaying(true);
+    renderDeck();
+    return;
+  }
+  syncQueued = true;
+  layerQueue.clear();
+  renderDeck();
+}
+
+function windowId(l) {
+  const w = LOOP_WINDOWS.find((x) => x.start === l.start && x.end === l.end);
+  return w ? w.id : "custom";
+}
+
+function setLayerWindow(t, start, end) {
+  const l = layers[t];
+  const s0 = Math.max(0, Math.min(31, start));
+  l.start = s0;
+  l.end = Math.max(s0 + 1, Math.min(32, end));
+  // A looping layer picks the new window up from its top at the next bar.
+  if (l.mode === "loop") {
+    if (state.playing) layerQueue.set(t, { ...(layerQueue.get(t) || {}), rew: true });
+    else l.origin = 0;
+  }
+  scheduleAutosave();
+  renderDeckRow(t);
+}
+
+function initDeck() {
+  const root = $("deck");
+  root.innerHTML = "";
+  deckRows = TRACKS.map((name, t) => {
+    const row = document.createElement("div");
+    row.className = "deck";
+    row.dataset.layer = String(t);
+    row.setAttribute("role", "group");
+    row.setAttribute("aria-label", `${name} layer transport`);
+    const reel = document.createElement("span");
+    reel.className = "reel";
+    reel.setAttribute("aria-hidden", "true");
+    const label = document.createElement("b");
+    label.textContent = name;
+    const count = document.createElement("span");
+    count.className = "tcount";
+    count.setAttribute("aria-hidden", "true");
+    count.textContent = "000";
+    const btn = (act, text, aria) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "mini";
+      b.dataset.la = act;
+      b.textContent = text;
+      b.setAttribute("aria-label", `${aria} ${name}`);
+      return b;
+    };
+    const play = btn("play", "▶", "Play in sync:");
+    const loop = btn("loop", "⟲", "Loop on its own:");
+    const stop = btn("stop", "■", "Stop:");
+    const rew = btn("rew", "◀◀", "Rewind to the top of the loop:");
+    const win = document.createElement("select");
+    win.setAttribute("aria-label", `${name} loop length`);
+    for (const w of LOOP_WINDOWS) win.add(new Option(w.label, w.id));
+    win.add(new Option("custom", "custom"));
+    const custom = document.createElement("span");
+    custom.className = "lcustom";
+    const num = (aria) => {
+      const i = document.createElement("input");
+      i.type = "number";
+      i.min = "1";
+      i.max = "32";
+      i.setAttribute("aria-label", `${name} loop ${aria} step`);
+      return i;
+    };
+    const ls = num("start");
+    const le = num("end");
+    custom.append(ls, "–", le);
+    const status = document.createElement("span");
+    status.className = "lstat hint";
+    row.append(reel, label, count, play, loop, stop, rew, win, custom, status);
+    play.addEventListener("click", () => layerAction(t, "play"));
+    loop.addEventListener("click", () => layerAction(t, "loop"));
+    stop.addEventListener("click", () => layerAction(t, "stop"));
+    rew.addEventListener("click", () => layerAction(t, "rew"));
+    win.addEventListener("change", () => {
+      const w = LOOP_WINDOWS.find((x) => x.id === win.value);
+      if (w) setLayerWindow(t, w.start, w.end);
+      else renderDeckRow(t, true);
+    });
+    const onCustom = () => setLayerWindow(t, (Number(ls.value) || 1) - 1, Number(le.value) || 16);
+    ls.addEventListener("change", onCustom);
+    le.addEventListener("change", onCustom);
+    root.appendChild(row);
+    return { row, count, play, loop, stop, win, custom, ls, le, status };
+  });
+  $("deck-all").addEventListener("click", syncAll);
+  $("deck-panel").addEventListener("toggle", () => { renderDeck(); renderCounters(); });
+  renderDeck();
+}
+
+function renderDeckRow(t, forceCustom = false) {
+  const r = deckRows[t];
+  if (!r) return;
+  const l = layers[t];
+  const q = layerQueue.get(t);
+  const pending = q?.mode || (q?.rew ? "rew" : syncQueued ? "play" : null);
+  const rolling = state.playing && l.mode !== "stop";
+  r.row.classList.toggle("rolling", rolling);
+  r.row.classList.toggle("stopped", l.mode === "stop");
+  for (const [b, m] of [[r.play, "play"], [r.loop, "loop"], [r.stop, "stop"]]) {
+    b.classList.toggle("on", l.mode === m);
+    b.classList.toggle("queued", pending === m);
+    b.setAttribute("aria-pressed", String(l.mode === m));
+  }
+  const id = forceCustom ? "custom" : windowId(l);
+  r.win.value = id;
+  r.custom.hidden = id !== "custom";
+  r.ls.value = String(l.start + 1);
+  r.le.value = String(l.end);
+  r.status.textContent = pending ? `${pending === "rew" ? "rewind" : pending} at next bar` : l.mode === "loop" ? `loop ${l.start + 1}–${l.end}` : "";
+}
+
+function renderDeck() {
+  for (let t = 0; t < deckRows.length; t++) renderDeckRow(t);
+  const all = $("deck-all");
+  if (all) all.classList.toggle("queued", syncQueued);
+  const tape = $("tape");
+  if (tape) {
+    tape.classList.toggle("on", state.tape);
+    tape.setAttribute("aria-pressed", String(state.tape));
+  }
+}
+
+// Tape counters: the layer's pass through its loop (or bars since PLAY).
+function renderCounters() {
+  if (!deckOpen()) return;
+  layers.forEach((l, t) => {
+    const r = deckRows[t];
+    if (!r) return;
+    let n = 0;
+    if (state.playing) {
+      const len = l.mode === "loop" ? Math.max(1, l.end - l.start) : BAR_STEPS;
+      n = Math.floor(Math.max(0, absStep - (l.mode === "loop" ? l.origin : 0)) / len) + 1;
+    }
+    r.count.textContent = String(n % 1000).padStart(3, "0");
+  });
+}
+
+/** Layers for an export: as they are now, with every loop starting at the top. */
+function exportLayers() {
+  return layers.map((l) => ({ ...l, origin: 0 }));
 }
 
 // ---- Mixer ----
@@ -1579,6 +2107,237 @@ function renderMixerRow(t) {
 
 function renderMixer() {
   for (let t = 0; t < mixInputs.length; t++) renderMixerRow(t);
+}
+
+// ---- Samples (mic / file -> IndexedDB -> pads and track sources) ----
+const sampleRecs = new Map(); // slot -> { name, rate, pcm }
+let micRec = null; // { slot, recorder, stream, timer }
+
+function sampleLabel(slot) {
+  const rec = sampleRecs.get(slot);
+  return rec ? `${slot}. ${rec.name}` : `Sample ${slot} (empty)`;
+}
+
+function renderSamples() {
+  const grid = $("smp-grid");
+  const canRec = !!(navigator.mediaDevices?.getUserMedia && window.MediaRecorder);
+  if (!grid.childElementCount) {
+    for (let slot = 1; slot <= SAMPLE_SLOTS; slot++) {
+      const box = document.createElement("div");
+      box.className = "smp";
+      box.dataset.slot = String(slot);
+      box.innerHTML = `<button class="pad" type="button" data-sact="play"><b>${slot}</b><small></small></button>
+        <div class="acts"><button class="mini rec" type="button" data-sact="rec">REC</button><button class="mini" type="button" data-sact="load">LOAD</button><button class="mini" type="button" data-sact="del">CLEAR</button></div>`;
+      grid.appendChild(box);
+    }
+  }
+  for (const box of grid.children) {
+    const slot = Number(box.dataset.slot);
+    const rec = sampleRecs.get(slot);
+    const recording = micRec?.slot === slot;
+    box.querySelector("small").textContent = recording ? "recording…" : rec ? `${rec.name} · ${(rec.pcm.length / rec.rate).toFixed(1)} s` : "empty";
+    const play = box.querySelector('[data-sact="play"]');
+    play.disabled = !rec;
+    play.setAttribute("aria-label", `Play ${sampleLabel(slot)}`);
+    const recBtn = box.querySelector('[data-sact="rec"]');
+    recBtn.hidden = !canRec;
+    recBtn.textContent = recording ? "STOP" : "REC";
+    recBtn.classList.toggle("on", recording);
+    recBtn.setAttribute("aria-label", recording ? `Stop recording sample ${slot}` : `Record sample ${slot} from the microphone`);
+    recBtn.disabled = !!micRec && !recording;
+    box.querySelector('[data-sact="load"]').setAttribute("aria-label", `Load an audio file into sample ${slot}`);
+    const del = box.querySelector('[data-sact="del"]');
+    del.disabled = !rec;
+    del.setAttribute("aria-label", `Clear sample ${slot}`);
+  }
+  // Show sample names in the track sound picker.
+  for (const opt of $("trk-src").querySelectorAll('option[value^="smp:"]')) {
+    opt.textContent = sampleLabel(Number(opt.value.slice(4)));
+  }
+  updateRows();
+}
+
+function updateRows() {
+  for (let t = 0; t < seqMeta.length; t++) {
+    if (seqMeta[t]) seqMeta[t].name.textContent = `${TRACKS[t]} · ${sourceLabel(state.pattern[t].source)}`;
+  }
+}
+
+async function storeSample(slot, channels, rate, name) {
+  const prep = prepareSample(channels, rate);
+  if (!prep) {
+    $("smp-status").textContent = "That was silent, nothing saved.";
+    return;
+  }
+  const rec = { name: name.slice(0, 32) || `Sample ${slot}`, rate: prep.rate, pcm: prep.pcm };
+  sampleRecs.set(slot, rec);
+  studio.setSample(slot, rec);
+  renderSamples();
+  let saved = true;
+  try {
+    await saveSample(slot, rec);
+  } catch {
+    saved = false;
+  }
+  $("smp-status").textContent = `Sample ${slot}: ${rec.name}, ${prep.seconds.toFixed(1)} s${prep.truncated ? ` (cut to ${MAX_SAMPLE_SEC} s)` : ""}.`
+    + (saved ? "" : " This browser won't store it, so it's gone after a reload.");
+  if (arm()) studio.playSample(slot, studio.ctx.currentTime + 0.02, 0.9);
+}
+
+async function decodeInto(slot, arrayBuffer, name) {
+  if (!arm()) return;
+  let buf;
+  try {
+    buf = await studio.ctx.decodeAudioData(arrayBuffer);
+  } catch {
+    $("smp-status").textContent = "Couldn't read that audio. Try WAV, MP3, M4A/AAC or OGG.";
+    return;
+  }
+  const channels = Array.from({ length: buf.numberOfChannels }, (_, c) => buf.getChannelData(c));
+  await storeSample(slot, channels, buf.sampleRate, name);
+}
+
+function pickFile(slot) {
+  const input = $("smp-file");
+  input.value = "";
+  input.onchange = async () => {
+    const file = input.files?.[0];
+    if (!file) return;
+    if (file.size > MAX_FILE_BYTES) {
+      $("smp-status").textContent = `That file is ${(file.size / 1048576).toFixed(1)} MB; the limit is ${MAX_FILE_BYTES / 1048576} MB.`;
+      return;
+    }
+    $("smp-status").textContent = "Loading…";
+    await decodeInto(slot, await file.arrayBuffer(), file.name.replace(/\.[^.]+$/, ""));
+  };
+  input.click();
+}
+
+function stopMic() {
+  if (!micRec) return;
+  clearTimeout(micRec.timer);
+  try { micRec.recorder.stop(); } catch { /* already stopped */ }
+}
+
+async function startMic(slot) {
+  if (micRec) return;
+  if (!arm()) return;
+  let stream;
+  try {
+    // Raw mic: no echo cancellation / noise suppression / AGC on a sample.
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+  } catch (e) {
+    $("smp-status").textContent = e?.name === "NotAllowedError" ? "Microphone access was blocked. Allow it in the browser's site settings to record." : "No microphone available.";
+    return;
+  }
+  const type = pickRecordType((t) => MediaRecorder.isTypeSupported(t));
+  let recorder;
+  try {
+    recorder = new MediaRecorder(stream, type ? { mimeType: type } : undefined);
+  } catch {
+    stream.getTracks().forEach((t) => t.stop());
+    $("smp-status").textContent = "This browser can't record audio.";
+    return;
+  }
+  const chunks = [];
+  recorder.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+  recorder.onstop = async () => {
+    // Release the mic right away (iPhone shows the orange dot until we do).
+    stream.getTracks().forEach((t) => t.stop());
+    micRec = null;
+    renderSamples();
+    const blob = new Blob(chunks, { type: recorder.mimeType || type || "audio/mp4" });
+    if (!blob.size) {
+      $("smp-status").textContent = "Nothing was recorded.";
+      return;
+    }
+    await decodeInto(slot, await blob.arrayBuffer(), `Mic ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`);
+  };
+  micRec = { slot, recorder, stream, timer: window.setTimeout(stopMic, MAX_SAMPLE_SEC * 1000) };
+  recorder.start();
+  $("smp-status").textContent = `Recording sample ${slot}… tap STOP (stops by itself at ${MAX_SAMPLE_SEC} s).`;
+  renderSamples();
+}
+
+async function clearSample(slot) {
+  const rec = sampleRecs.get(slot);
+  if (!rec) return;
+  sampleRecs.delete(slot);
+  studio.setSample(slot, null);
+  try { await deleteSample(slot); } catch { /* not stored */ }
+  renderSamples();
+  showSnack(`Cleared sample ${slot}`, false, async () => {
+    sampleRecs.set(slot, rec);
+    studio.setSample(slot, rec);
+    try { await saveSample(slot, rec); } catch { /* keep in memory */ }
+    renderSamples();
+  });
+}
+
+async function initSamples() {
+  $("smp-grid").addEventListener("click", (e) => {
+    const btn = e.target.closest?.("[data-sact]");
+    if (!btn) return;
+    const slot = Number(btn.closest(".smp").dataset.slot);
+    const act = btn.dataset.sact;
+    if (act === "play" && arm()) studio.playSample(slot, studio.ctx.currentTime, 0.9);
+    else if (act === "rec") (micRec ? stopMic() : void startMic(slot));
+    else if (act === "load") pickFile(slot);
+    else if (act === "del") void clearSample(slot);
+  });
+  renderSamples();
+  const stored = await loadSamples();
+  for (const [slot, rec] of stored) {
+    sampleRecs.set(slot, rec);
+    studio.setSample(slot, rec);
+  }
+  renderSamples();
+}
+
+// ---- MIDI input (Web MIDI; not available on iPhone/iPad Safari) ----
+let midiOn = false;
+
+function midiNote(msg) {
+  if (!arm()) return;
+  if (msg.ch === 9) {
+    // GM drums on channel 10 play the matching sequencer track's sound.
+    if (msg.type !== "on") return;
+    const track = drumTrackForNote(msg.note);
+    const row = state.pattern[track];
+    studio.triggerSource(row.source, row.steps[0], studio.ctx.currentTime, msg.vel, { track });
+    return;
+  }
+  if (msg.type === "on") studio.down(msg.note, `midi:${msg.note}`, Math.max(0.2, msg.vel));
+  else studio.up(msg.note, `midi:${msg.note}`);
+}
+
+function initMidi() {
+  const btn = $("midi");
+  const status = $("midi-status");
+  if (!midiSupported()) {
+    btn.disabled = true;
+    btn.title = "Web MIDI isn't available in this browser";
+    status.textContent = "MIDI input works in Chrome, Edge and Firefox on desktop and Android. iPhone and iPad Safari don't support Web MIDI.";
+    return;
+  }
+  status.textContent = "Connect a MIDI keyboard or pad controller, then press MIDI. Channel 10 plays the drum tracks (GM map); other channels play the synth.";
+  const show = (names) => {
+    status.textContent = names.length ? `MIDI: ${names.join(", ")}` : "MIDI is on. No devices connected yet.";
+  };
+  btn.addEventListener("click", async () => {
+    if (midiOn) return;
+    btn.disabled = true;
+    const res = await connectMidi(midiNote, show);
+    btn.disabled = false;
+    if (!res.ok) {
+      status.textContent = res.reason === "denied" ? "MIDI access was blocked for this site." : "Couldn't start MIDI.";
+      return;
+    }
+    midiOn = true;
+    btn.classList.add("on");
+    btn.setAttribute("aria-pressed", "true");
+    show(res.inputs);
+  });
 }
 
 // ---- Recording with optional one-bar count-in ----
@@ -1833,14 +2592,24 @@ function bind() {
   $("vol").addEventListener("input", () => {
     if (studio.armed) studio.setMasterGain(Number($("vol").value));
   });
+  // STOP ALL: stops every section looper (and the song). Starting sound is
+  // always a section's own ▶ PLAY, SONG, or the tape deck.
   $("play").addEventListener("click", () => {
     cancelCountIn();
-    setPlaying(!state.playing);
+    if (state.playing) setPlaying(false);
   });
   $("limiter").addEventListener("click", () => {
     commit(() => { state.limiter = !state.limiter; });
     studio.setLimiter(state.limiter);
     $("limiter").classList.toggle("on", state.limiter);
+  });
+  $("tape").addEventListener("click", () => {
+    state.tape = !state.tape;
+    if (studio.armed) studio.setTape(state.tape);
+    else studio.tapeOn = state.tape;
+    renderDeck();
+    scheduleAutosave();
+    showSnack(state.tape ? "TAPE on: wow, flutter, warm saturation and hiss (still speaker-safe)" : "TAPE off");
   });
   $("crt").addEventListener("click", () => {
     state.crt = !state.crt;
@@ -1917,9 +2686,11 @@ function bind() {
     }
     if (e.metaKey || e.ctrlKey || e.altKey) return;
     if (key === " ") {
+      // Space = the selected section's own ▶ PLAY; while playing it stops everything.
       e.preventDefault();
       cancelCountIn();
-      setPlaying(!state.playing);
+      if (state.playing) setPlaying(false);
+      else sectionPlay(state.bank);
       return;
     }
     if (key === "escape") {
@@ -1977,6 +2748,9 @@ initSeqEvents();
 initBanks();
 initInspector();
 initMixer();
+initDeck();
+void initSamples();
+initMidi();
 renderPaint();
 renderSeq();
 bind();
@@ -1984,7 +2758,8 @@ studio.setMixer(state.mixer);
 renderBanks();
 renderMixer();
 renderInspector();
-loadAutosave();
+const restored = loadAutosave();
+const fromLink = Boolean(shareCodeFromHash(location.hash));
 syncControls();
 renderSlots();
 renderUndo();
@@ -2001,4 +2776,9 @@ if ("serviceWorker" in navigator && location.protocol !== "file:") {
   });
 }
 void loadShareFromHash();
-$("toast").textContent = "Your beat autosaves in this browser and the app works offline once loaded. SHARE makes a link that opens this exact beat; EXPORT WAV renders a clean file. Keys: A–' synth (W E T Y U O P are the black keys), 1–8 drums, Space play/stop, Ctrl/Cmd+Z undo, Shift+Ctrl/Cmd+Z redo.";
+if (!restored && !fromLink) {
+  showSnack(legacyReplaced
+    ? "The old ATLANTA NIGHT starter (never edited) was replaced by trap sections A–D. Tap ▶ PLAY on any section; tap another to layer it in"
+    : "Four 808 trap sections are loaded: tap ▶ PLAY on A (or any section). Tap another ▶ PLAY to layer it in at the next bar; ▶ SONG plays A A B A C D");
+}
+$("toast").textContent = "Your beat autosaves in this browser and the app works offline once loaded. SHARE makes a link that opens this exact beat; EXPORT WAV renders a clean file. Keys: A–' synth (W E T Y U O P are the black keys), 1–8 drums, Space plays the selected section / stops all, Ctrl/Cmd+Z undo, Shift+Ctrl/Cmd+Z redo.";
