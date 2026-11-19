@@ -12,6 +12,25 @@ import { classicState, isLegacyStarter } from "../src/classics.mjs";
 let WA = null;
 try { WA = await import("node-web-audio-api"); } catch { /* optional dev dependency */ }
 const SEC = 0.1;
+// True peak: 4x oversampled with a windowed-sinc interpolator (BS.1770-style).
+function truePeak(x) {
+  const L = 4, T = 12, h = [];
+  for (let n = -T * L; n <= T * L; n++) {
+    const t = n / L;
+    h.push((t === 0 ? 1 : Math.sin(Math.PI * t) / (Math.PI * t)) * (0.5 + 0.5 * Math.cos((Math.PI * n) / (T * L + 1))));
+  }
+  let pk = 0;
+  for (let i = T; i < x.length - T; i++) {
+    pk = Math.max(pk, Math.abs(x[i]));
+    if (Math.abs(x[i]) < 0.6 && Math.abs(x[i + 1]) < 0.6) continue; // overs only happen near the ceiling
+    for (let p = 1; p < L; p++) {
+      let acc = 0;
+      for (let k = -T; k <= T; k++) { const j = k * L - p + T * L; if (j >= 0 && j < h.length) acc += x[i + k] * h[j]; }
+      pk = Math.max(pk, Math.abs(acc));
+    }
+  }
+  return pk;
+}
 
 test("looper basics: defaults stopped at 2 bars; lengths ½ / 1 / 2 bars; only lengths persist", () => {
   assert.deepEqual(defaultLoopers(), Array.from({ length: 4 }, () => ({ on: false, len: 32, origin: 0 })));
@@ -86,7 +105,7 @@ test("the old ATLANTA NIGHT starter save is recognised (and only when untouched)
   assert.equal(isLegacyStarter(defaultState()), false);
 });
 
-test("loudness: all four section loopers layered, mixer + sends + master at max, limiter off (and with TAPE) stay below -1.2 dBFS", { skip: !WA && "node-web-audio-api not installed (npm install)" }, async () => {
+test("loudness: all four section loopers layered, mixer + sends + master at max, limiter off (and with TAPE) stay below -1.2 dBFS sample and true peak", { skip: !WA && "node-web-audio-api not installed (npm install)" }, async () => {
   globalThis.OfflineAudioContext ??= WA.OfflineAudioContext;
   globalThis.window ??= globalThis;
   const { renderWav } = await import("../src/export.mjs");
@@ -101,6 +120,8 @@ test("loudness: all four section loopers layered, mixer + sends + master at max,
     let ss = 0, n = 0;
     for (const c of r.channels) for (const x of c) { ss += x * x; n++; }
     assert.ok(peak <= -1.2, `peak ${peak.toFixed(2)} dBFS (tape ${tape})`);
+    const tp = 20 * Math.log10(Math.max(...r.channels.map(truePeak)));
+    assert.ok(tp <= -1.2, `true peak ${tp.toFixed(2)} dBFS (tape ${tape})`);
     assert.ok(10 * Math.log10(ss / n) > -30, "audible");
   }
 });

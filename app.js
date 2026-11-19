@@ -607,7 +607,7 @@ function renderLcd() {
   }
   if (!state.armed) {
     title.textContent = "Idle";
-    sub.textContent = "Audio stays off until you touch a key, pad, or Play. Sound design from 808 PIT.";
+    sub.textContent = "Audio stays off until you touch a key, a pad or a section's ▶ PLAY. Sound design from 808 PIT.";
     return;
   }
   if (state.active.length) {
@@ -2446,9 +2446,9 @@ function drawMainScope(scope, frame) {
     scope.height = h;
   }
   const ctx = scope.getContext("2d");
-  ctx.fillStyle = "#100c0b";
+  ctx.fillStyle = "#0d0815";
   ctx.fillRect(0, 0, w, h);
-  ctx.strokeStyle = "#3d312b";
+  ctx.strokeStyle = "#2e2342";
   ctx.lineWidth = 1;
   ctx.beginPath();
   for (let i = 1; i < 4; i++) {
@@ -2457,7 +2457,7 @@ function drawMainScope(scope, frame) {
   }
   ctx.stroke();
   ctx.beginPath();
-  ctx.strokeStyle = "#e25c4a";
+  ctx.strokeStyle = "#ff3b6b";
   ctx.lineWidth = Math.max(1.5, dpr);
   const time = frame.time;
   if (time) {
@@ -2476,9 +2476,9 @@ function drawMainScope(scope, frame) {
   }
   ctx.stroke();
   const meterW = Math.max(8, Math.floor(w * 0.04));
-  ctx.fillStyle = "#3d312b";
+  ctx.fillStyle = "#2e2342";
   ctx.fillRect(w - meterW, 0, meterW, h);
-  ctx.fillStyle = "#e25c4a";
+  ctx.fillStyle = "#f6c445";
   ctx.fillRect(w - meterW, h - frame.level * h, meterW, frame.level * h);
 }
 
@@ -2487,7 +2487,7 @@ function drawMini(c, isFreq, frame) {
   g.clearRect(0, 0, c.width, c.height);
   if (isFreq) {
     if (!frame.freq) return;
-    g.fillStyle = "rgba(190,249,255,0.9)";
+    g.fillStyle = "rgba(246,196,69,0.9)";
     const len = frame.freq.length;
     for (let i = 0; i < len; i += 2) {
       const v = frame.freq[i] / 255;
@@ -2495,7 +2495,7 @@ function drawMini(c, isFreq, frame) {
       g.fillRect((i / len) * c.width, c.height - v * c.height, (c.width / len) * 1.6, v * c.height);
     }
   } else {
-    g.strokeStyle = "#7df9ff";
+    g.strokeStyle = "#c792ff";
     g.beginPath();
     const time = frame.time;
     if (!time) {
