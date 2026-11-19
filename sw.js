@@ -3,7 +3,7 @@
 // picked up on the next load and files never mix versions), falling back to
 // the cache only when offline or the network stalls. Bump VERSION when the
 // shell file list changes; old caches are deleted on activate.
-const VERSION = "v4";
+const VERSION = "v5";
 const CACHE = `nocturne-shell-${VERSION}`;
 const SHELL = [
   "./", // not "./index.html": hosts with clean URLs (Vercel) redirect it

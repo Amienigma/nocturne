@@ -147,6 +147,8 @@ export class Studio {
     this.sampleRecs = new Map(); // slot (1-8) -> { name, rate, pcm }
     this.samples = new Map(); // slot -> AudioBuffer for this.ctx (built on first use)
     this.limiterOn = true;
+    this.tapeOn = false; // TAPE: wow/flutter + saturation + hiss, before the safety stage
+    this.tape = null;
     this.masterGain = 0.85;
     this.patch = { ...DEFAULT_PATCH };
     this.voices = new Map();
@@ -276,6 +278,7 @@ export class Studio {
       this.buses[name] = g;
     }
     this.pitFilter.connect(this.buses["808"]);
+    if (this.tapeOn) this.rewireMaster(); // TAPE needs the pink-noise buffer above
   }
 
   // Always-on safety stage (cannot be bypassed by the LIMITER button):
@@ -349,7 +352,8 @@ export class Studio {
     try { this.master.disconnect(); } catch { /* first wire */ }
     try { this.trim.disconnect(); } catch { /* first wire */ }
     try { this.compressor.disconnect(); } catch { /* first wire */ }
-    this.master.connect(this.trim);
+    if (this.tapeOn && this.pink) this.master.connect(this.ensureTape().in);
+    else this.master.connect(this.trim);
     const post = this.limiterOn ? POST_GAIN_LIMITER : POST_GAIN_DIRECT;
     this.post.gain.setTargetAtTime(post, this.ctx.currentTime, 0.02);
     if (this.limiterOn) {
@@ -488,6 +492,65 @@ export class Studio {
         this.armIdleCheck();
       }
     }
+  }
+
+  // ---- TAPE (cassette) colour --------------------------------------------
+  // master -> delay modulated by a slow "wow" (0.55 Hz) and a "flutter"
+  // (6.5 Hz) LFO -> gentle level-matched tanh saturation -> trim, plus a
+  // quiet high-passed hiss. It all sits *before* the always-on safety stage,
+  // so the ceiling still holds. Nodes exist only while TAPE is on, and the
+  // whole context still suspends when idle.
+  ensureTape() {
+    if (this.tape) return this.tape;
+    const C = this.ctx;
+    const t = C.currentTime;
+    const input = C.createGain();
+    const delay = C.createDelay(0.05);
+    delay.delayTime.value = 0.008;
+    const wow = C.createOscillator();
+    wow.frequency.value = 0.55;
+    const wowAmt = C.createGain();
+    wowAmt.gain.value = 0.0011; // ~±0.8 cents·s → a few cents of pitch wobble
+    const flutter = C.createOscillator();
+    flutter.frequency.value = 6.5;
+    const flutAmt = C.createGain();
+    flutAmt.gain.value = 0.00009;
+    wow.connect(wowAmt).connect(delay.delayTime);
+    flutter.connect(flutAmt).connect(delay.delayTime);
+    const sat = C.createWaveShaper();
+    sat.curve = distortionCurve(1.25);
+    sat.oversample = "2x";
+    const comp = C.createGain();
+    comp.gain.value = 0.82; // level-match: TAPE adds colour, not loudness
+    const tone = C.createBiquadFilter();
+    tone.type = "lowpass";
+    tone.frequency.value = 13500;
+    input.connect(delay).connect(sat).connect(comp).connect(tone).connect(this.trim);
+    const hiss = C.createBufferSource();
+    hiss.buffer = this.pink;
+    hiss.loop = true;
+    const hissHp = C.createBiquadFilter();
+    hissHp.type = "highpass";
+    hissHp.frequency.value = 3500;
+    const hissGain = C.createGain();
+    hissGain.gain.value = 0.006; // about -60 dBFS after the mix trim
+    hiss.connect(hissHp).connect(hissGain).connect(this.trim);
+    wow.start(t);
+    flutter.start(t);
+    hiss.start(t);
+    this.tape = { in: input, nodes: [wow, flutter, hiss], out: [tone, hissGain] };
+    return this.tape;
+  }
+
+  setTape(on) {
+    this.tapeOn = !!on;
+    if (!this.ctx) return;
+    if (!this.tapeOn && this.tape) {
+      for (const n of this.tape.nodes) { try { n.stop(); } catch { /* done */ } }
+      for (const n of this.tape.out) { try { n.disconnect(); } catch { /* done */ } }
+      this.tape = null;
+    }
+    this.rewireMaster();
   }
 
   setLimiter(on) {
@@ -1512,12 +1575,14 @@ export class Studio {
     const melodic = sourceIsPit(source) || sourceIsN808(source);
     this.glide = opts.slide && melodic && prevHz ? { fromHz: prevHz, sec: Math.max(0.03, opts.slideSec || 0.08) } : null;
     this.gateSec = opts.gate > 0 ? opts.gate : 0;
+    this.pitchSemi = Number.isFinite(opts.pitch) ? opts.pitch : 0;
     try {
       this.playSource(source, step, when, velocity);
     } finally {
       this.route = null;
       this.glide = null;
       this.gateSec = 0;
+      this.pitchSemi = 0;
     }
     if (melodic && track >= 0) this.trackHz.set(track, this.lastHz);
   }
@@ -1551,7 +1616,7 @@ export class Studio {
       return;
     }
     if (sourceIsTr808(source)) {
-      this.play808(source.slice(3), t, vel, step?.note, gate);
+      this.play808(source.slice(3), t, vel, step?.note, gate, this.pitchSemi || 0);
       return;
     }
     const slot = sampleSlotFromSource(source);
@@ -1584,7 +1649,7 @@ export class Studio {
     return buf;
   }
 
-  play808(id, when, velocity = 0.9, midi = null, gate = 0) {
+  play808(id, when, velocity = 0.9, midi = null, gate = 0, pitch = 0) {
     if (!this.arm()) return;
     const C = this.ctx;
     const t = when;
@@ -1603,10 +1668,13 @@ export class Studio {
       g.gain.setValueAtTime(0, start + attack + dec + 0.001);
       end = Math.max(end, start + attack + dec + 0.02);
     };
+    // Roll pitch ramps: `pitch` semitones on every oscillator / noise source.
+    const semi = Math.max(-12, Math.min(12, pitch || 0));
     const osc = (type, hz, dest) => {
       const o = C.createOscillator();
       o.type = type;
       o.frequency.setValueAtTime(hz, t);
+      if (semi) o.detune.value = semi * 100;
       o.connect(dest);
       srcs.push(o);
       return o;
@@ -1614,6 +1682,7 @@ export class Studio {
     const noise = (dest, buffer = this.white) => {
       const b = C.createBufferSource();
       b.buffer = buffer;
+      if (semi) b.playbackRate.value = Math.pow(2, semi / 12);
       b.connect(dest);
       srcs.push(b);
       return b;

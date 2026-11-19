@@ -3,7 +3,7 @@
 // on an OfflineAudioContext — glitch-free regardless of device load.
 import { Studio } from "./audio.mjs";
 import { encodeWav, trimTail } from "./wav.mjs";
-import { bankForLoop, stepHits, seededRng } from "./sequencer.mjs";
+import { bankForLoop, layerHits, seededRng } from "./sequencer.mjs";
 
 export const EXPORT_BARS = [1, 2, 4, 8];
 export const EXPORT_RATE = 48000;
@@ -21,7 +21,7 @@ export function exportSteps(state, bars) {
 }
 
 /** Same timing, mute/solo, ratchet, probability and song rules as the live scheduler. */
-export function scheduleSteps(state, bars, startAt = 0, rng = seededRng(1)) {
+export function scheduleSteps(state, bars, startAt = 0, rng = seededRng(1), layers = null) {
   const stepSec = 60 / state.bpm / 4;
   const total = exportSteps(state, bars);
   const banks = Array.isArray(state.banks) ? state.banks : [state.pattern];
@@ -32,7 +32,7 @@ export function scheduleSteps(state, bars, startAt = 0, rng = seededRng(1)) {
     const pattern = Array.isArray(state.banks) ? banks[bankForLoop(state, loop)] : state.pattern;
     const swing = step % 2 === 1 ? (state.swing / 100) * stepSec * 0.5 : 0;
     const when = startAt + i * stepSec + swing;
-    for (const h of stepHits(pattern, step, stepSec, rng)) {
+    for (const h of layerHits(pattern, layers, i, step, stepSec, rng)) {
       events.push({ source: h.source, cell: h.cell, when: when + h.at, vel: h.vel, opts: h.opts });
     }
   }
@@ -44,7 +44,7 @@ export function scheduleSteps(state, bars, startAt = 0, rng = seededRng(1)) {
  * Render `bars` bars to WAV.
  * @returns {Promise<{blob: Blob, seconds: number, peak: number, channels: Float32Array[]}>}
  */
-export async function renderWav(state, { bars = 4, bitDepth = 16, masterGain = 0.85, samples = null, onProgress = () => {} } = {}) {
+export async function renderWav(state, { bars = 4, bitDepth = 16, masterGain = 0.85, samples = null, tape = false, layers = null, onProgress = () => {} } = {}) {
   const Ctor = globalThis.OfflineAudioContext || globalThis.webkitOfflineAudioContext;
   if (!Ctor) throw new Error("This browser can't render audio offline");
   const music = (60 / state.bpm / 4) * exportSteps(state, bars);
@@ -56,6 +56,7 @@ export async function renderWav(state, { bars = 4, bitDepth = 16, masterGain = 0
   s.keepAwake = true;
   s.masterGain = masterGain;
   s.limiterOn = !!state.limiter;
+  s.tapeOn = !!tape;
   s.patch = { ...s.patch, ...state.patch };
   s.build();
   s.applyPatch();
@@ -64,7 +65,7 @@ export async function renderWav(state, { bars = 4, bitDepth = 16, masterGain = 0
   s.setSendTempo(state.bpm);
   // Metronome stays silent: metroBus gain is 0 and no clicks are scheduled.
   const start = 0.02;
-  const events = scheduleSteps(state, bars, start);
+  const events = scheduleSteps(state, bars, start, seededRng(1), layers);
   let next = 0;
   const scheduleUntil = (t) => {
     while (next < events.length && events[next].when < t) {

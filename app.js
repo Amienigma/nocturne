@@ -57,8 +57,8 @@ import {
   toStored,
   fromStored,
 } from "./src/state-io.mjs";
-import { stepHits } from "./src/sequencer.mjs";
-import { classicBanks, classicMixer, classicState, CLASSIC_BPM, CLASSIC_SWING, CLASSIC_CHAIN, CLASSIC_SECTIONS } from "./src/classics.mjs";
+import { layerHits, sanitizeLayers } from "./src/sequencer.mjs";
+import { classicBanks, classicMixer, classicState, CLASSIC_BPM, CLASSIC_SWING, CLASSIC_LENGTH, CLASSIC_CHAIN, CLASSIC_SECTIONS } from "./src/classics.mjs";
 import { SAMPLE_SLOTS, MAX_FILE_BYTES, MAX_SAMPLE_SEC, prepareSample, loadSamples, saveSample, deleteSample } from "./src/samples.mjs";
 import { midiSupported, connectMidi, drumTrackForNote } from "./src/midi.mjs";
 import { renderWav, EXPORT_BARS } from "./src/export.mjs";
@@ -73,7 +73,7 @@ const state = withPatternAlias({
   playing: false,
   bpm: CLASSIC_BPM,
   swing: CLASSIC_SWING,
-  length: 16,
+  length: CLASSIC_LENGTH,
   // Pattern banks A–D; `state.pattern` is an alias for banks[bank]. A fresh
   // session (no autosave, no share link) starts with four classic TR-808
   // sections; saved beats replace them in loadAutosave() / share links.
@@ -98,7 +98,10 @@ const state = withPatternAlias({
   soundBank: "Memphis",
   active: [],
   metronome: defaultMetronome(),
+  tape: false,
 });
+// Tape-deck layer transports (one per track); see the "Tape deck" section.
+let layers = sanitizeLayers(null, TRACKS.length);
 
 const $ = (id) => document.getElementById(id);
 window.__nocturneState = state; // for tests/debugging
@@ -251,13 +254,25 @@ function saveNow() {
   clearTimeout(autosaveTimer);
   autosaveTimer = 0;
   try {
-    store()?.setItem(AUTOSAVE_KEY, JSON.stringify(toStored(state)));
+    // Optional extras next to the packed beat (older builds ignore them):
+    // TAPE on/off and each layer's loop window.
+    const extra = { tape: state.tape, layers: layers.map(({ start, end }) => ({ start, end })) };
+    store()?.setItem(AUTOSAVE_KEY, JSON.stringify({ ...toStored(state), ...extra }));
   } catch { /* storage full or blocked: keep playing */ }
 }
 
 function loadAutosave() {
   const raw = store()?.getItem(AUTOSAVE_KEY);
-  return raw ? applyState(raw) : false;
+  if (!raw) return false;
+  const ok = applyState(raw);
+  const extra = ok ? safeParse(raw) : null;
+  if (extra && typeof extra === "object") {
+    if (Array.isArray(extra.layers)) layers = sanitizeLayers(extra.layers.map((l) => ({ ...l, mode: "play" })), TRACKS.length);
+    state.tape = extra.tape === true;
+    studio.setTape(state.tape);
+    renderDeck();
+  }
+  return ok;
 }
 
 function readSlots() {
@@ -438,6 +453,8 @@ async function exportWav() {
       samples: sampleRecs,
       bitDepth,
       masterGain: Number($("vol").value),
+      tape: state.tape,
+      layers: exportLayers(),
       onProgress: (p) => { prog.value = p; status.textContent = `Rendering… ${Math.round(p * 100)}%`; },
     });
     window.__lastExport = res; // for tests/debugging
@@ -919,7 +936,7 @@ function updateCell(track, step) {
   btn.style.setProperty("--vel", String(cell.vel));
   btn.setAttribute("aria-pressed", String(cell.on));
   const extras = cellExtras(cell);
-  if (cell.on && cell.rat > 1) btn.dataset.rat = String(cell.rat);
+  if (cell.on && cell.rat !== 1) btn.dataset.rat = String(cell.rat);
   else delete btn.dataset.rat;
   btn.classList.toggle("prob", cell.on && cell.prob < 1);
   btn.classList.toggle("slide", cell.on && cell.slide);
@@ -931,7 +948,8 @@ function updateCell(track, step) {
 
 function cellExtras(cell) {
   let out = "";
-  if (cell.rat > 1) out += `, roll ×${cell.rat}`;
+  if (cell.rat !== 1) out += `, roll ${cell.rat >= 2 ? `×${cell.rat}` : cell.rat === 1.5 ? "1/24 triplet" : "1/12 triplet"}`;
+  if (cell.ramp) out += `, ramp ${["", "louder", "softer", "pitch up", "pitch down", "louder + pitch up", "softer + pitch down"][cell.ramp] || ""}`;
   if (cell.prob < 1) out += `, ${Math.round(cell.prob * 100)}% chance`;
   if (cell.slide) out += ", slide";
   if (cell.gate > 0) out += `, length ${cell.gate} step${cell.gate === 1 ? "" : "s"}`;
@@ -1245,7 +1263,7 @@ function logSwitch(bank, why) {
   transportLog.push({ step: absStep, bank, song: state.song, why });
   if (transportLog.length > 64) transportLog.shift();
 }
-window.__nocturneTransport = () => ({ playing: state.playing, absStep, stepIndex, songPos, queuedBank, queuedMode, bank: state.bank, song: state.song, log: transportLog.slice() });
+window.__nocturneTransport = () => ({ layers: layers.map((l) => ({ ...l })), layerQueue: [...layerQueue.keys()], syncQueued, playing: state.playing, absStep, stepIndex, songPos, queuedBank, queuedMode, bank: state.bank, song: state.song, log: transportLog.slice() });
 const lightTimers = new Set();
 
 function outputDelay() {
@@ -1288,19 +1306,26 @@ function scheduler() {
   const stepSec = 60 / state.bpm / 4;
   while (nextTime < studio.ctx.currentTime + 0.12) {
     if (absStep > 0) {
+      const bar = absStep % BAR_STEPS === 0;
       // Section / mode changes land on the next bar line (every 16 steps), so
       // everything stays in time; the new section starts from its step 1.
-      if (absStep % BAR_STEPS === 0 && (queuedBank != null || queuedMode)) {
+      if (bar && (queuedBank != null || queuedMode)) {
         applyQueued(nextTime);
         stepIndex = 0;
       } else if (stepIndex === 0 && state.song) {
         advanceSong(nextTime);
       }
+      // Tape-deck layer changes (play / loop / stop / rewind / sync) also wait for the bar line.
+      if (bar && (layerQueue.size || syncQueued)) {
+        if (syncQueued) stepIndex = 0;
+        applyLayerQueue(nextTime);
+      }
+      if (bar && deckOpen()) queueUi(nextTime, renderCounters);
     }
     const step = stepIndex % state.length;
     const swing = step % 2 === 1 ? (state.swing / 100) * stepSec * 0.5 : 0;
     const when = nextTime + swing;
-    for (const h of stepHits(state.pattern, step, stepSec)) {
+    for (const h of layerHits(state.pattern, layers, absStep, step, stepSec)) {
       studio.triggerSource(h.source, h.cell, when + h.at, h.vel, h.opts);
     }
     queueLight(step, when);
@@ -1334,6 +1359,10 @@ function setPlaying(on, startAt = null) {
     absStep = 0;
     songPos = 0;
     transportLog.length = 0;
+    for (const l of layers) l.origin = 0;
+    for (const [t, q] of layerQueue) applyLayerOp(t, q, 0);
+    layerQueue.clear();
+    syncQueued = false;
     if (state.song && state.chain.length) switchBank(state.chain[0]);
     else if (queuedBank != null) switchBank(queuedBank);
     queuedBank = null;
@@ -1348,10 +1377,12 @@ function setPlaying(on, startAt = null) {
     queuedBank = null;
     queuedMode = null;
     renderBanks();
+    renderDeck();
     // The AudioContext suspends itself once tails have rung out (studio idle check).
     studio.lastUse = performance.now();
   }
   renderLcd();
+  if (on) renderDeck();
 }
 
 // ---- Step focus + inspector (velocity, roll, chance, length, slide) ----
@@ -1376,13 +1407,14 @@ function renderInspector() {
   $("insp-vel-val").textContent = `${Math.round(cell.vel * 100)}%`;
   $("insp-rat").value = String(cell.rat);
   $("insp-prob").value = String(cell.prob);
+  $("insp-ramp").value = String(cell.ramp || 0);
   $("insp-gate").value = String(cell.gate);
   const slide = $("insp-slide");
   slide.classList.toggle("on", cell.slide);
   slide.setAttribute("aria-pressed", String(cell.slide));
   slide.disabled = !melodic;
   slide.title = melodic ? "Glide from the previous note on this track" : "Slide works on 808 / synth tracks";
-  for (const id of ["insp-vel", "insp-rat", "insp-prob", "insp-gate"]) $(id).disabled = !cell.on;
+  for (const id of ["insp-vel", "insp-rat", "insp-prob", "insp-gate", "insp-ramp"]) $(id).disabled = !cell.on;
   if (!cell.on) slide.disabled = true;
 }
 
@@ -1404,6 +1436,7 @@ function initInspector() {
   vel.addEventListener("change", endEdit);
   $("insp-rat").addEventListener("change", (e) => editFocused({ rat: Number(e.target.value) }));
   $("insp-prob").addEventListener("change", (e) => editFocused({ prob: Number(e.target.value) }));
+  $("insp-ramp").addEventListener("change", (e) => editFocused({ ramp: Number(e.target.value) }));
   $("insp-gate").addEventListener("change", (e) => editFocused({ gate: Number(e.target.value) }));
   $("insp-slide").addEventListener("click", () => {
     const { t, s } = state.focusStep;
@@ -1681,6 +1714,227 @@ function initBanks() {
     showSnack("Song cleared: tap +A, +B, +C, +D to build it", true);
   });
   $("classic-load").addEventListener("click", loadClassics);
+}
+
+// ---- Tape deck: a cassette transport per layer (track) ----
+// ▶ PLAY: the layer plays in sync with the beat. ⟲ LOOP: it loops its own
+// window (¼ bar … 2 bars, or custom steps) on the global clock, so layers of
+// different lengths run polymetrically. ■ STOP: silent. ◀◀ REW: back to the
+// top of its loop. While the beat plays, every change lands on the next bar
+// line (like section switches). ▶ ALL puts every layer back in sync at the
+// next bar. Reels spin with CSS (no rAF) and only while a layer rolls; the tape
+// counters update once per bar, and only while the deck panel is open.
+const layerQueue = new Map(); // track -> { mode?, rew? }
+let syncQueued = false;
+const LOOP_WINDOWS = [
+  { id: "4", label: "¼ bar", start: 0, end: 4 },
+  { id: "8", label: "½ bar", start: 0, end: 8 },
+  { id: "16", label: "1 bar", start: 0, end: 16 },
+  { id: "32", label: "2 bars", start: 0, end: 32 },
+];
+let deckRows = [];
+const deckOpen = () => Boolean($("deck-panel")?.open);
+
+function applyLayerOp(t, q, at) {
+  const l = layers[t];
+  if (q.mode === "play" || q.mode === "stop") l.mode = q.mode;
+  if (q.mode === "loop" && l.mode !== "loop") {
+    l.mode = "loop";
+    l.origin = at;
+  }
+  if (q.rew) {
+    if (l.mode === "play") l.mode = "loop";
+    l.origin = at;
+  }
+}
+
+function applyLayerQueue(when) {
+  if (syncQueued) {
+    for (const l of layers) {
+      l.mode = "play";
+      l.origin = absStep;
+    }
+    logSwitch(state.bank, "sync");
+  }
+  for (const [t, q] of layerQueue) applyLayerOp(t, q, absStep);
+  if (layerQueue.size) logSwitch(state.bank, "layers");
+  layerQueue.clear();
+  syncQueued = false;
+  queueUi(when, renderDeck);
+}
+
+/** A deck button on layer `t`: "play" | "loop" | "stop" | "rew". */
+function layerAction(t, action) {
+  const q = action === "rew" ? { rew: true } : { mode: action };
+  if (!state.playing) {
+    applyLayerOp(t, q, 0);
+    if (action === "play" || action === "loop") {
+      cancelCountIn();
+      setPlaying(true);
+    }
+    renderDeck();
+    return;
+  }
+  const prev = layerQueue.get(t) || {};
+  layerQueue.set(t, action === "rew" ? { ...prev, rew: true } : { ...prev, mode: action });
+  renderDeckRow(t);
+}
+
+function syncAll() {
+  if (!state.playing) {
+    for (const l of layers) { l.mode = "play"; l.origin = 0; }
+    layerQueue.clear();
+    cancelCountIn();
+    setPlaying(true);
+    renderDeck();
+    return;
+  }
+  syncQueued = true;
+  layerQueue.clear();
+  renderDeck();
+}
+
+function windowId(l) {
+  const w = LOOP_WINDOWS.find((x) => x.start === l.start && x.end === l.end);
+  return w ? w.id : "custom";
+}
+
+function setLayerWindow(t, start, end) {
+  const l = layers[t];
+  const s0 = Math.max(0, Math.min(31, start));
+  l.start = s0;
+  l.end = Math.max(s0 + 1, Math.min(32, end));
+  // A looping layer picks the new window up from its top at the next bar.
+  if (l.mode === "loop") {
+    if (state.playing) layerQueue.set(t, { ...(layerQueue.get(t) || {}), rew: true });
+    else l.origin = 0;
+  }
+  scheduleAutosave();
+  renderDeckRow(t);
+}
+
+function initDeck() {
+  const root = $("deck");
+  root.innerHTML = "";
+  deckRows = TRACKS.map((name, t) => {
+    const row = document.createElement("div");
+    row.className = "deck";
+    row.dataset.layer = String(t);
+    row.setAttribute("role", "group");
+    row.setAttribute("aria-label", `${name} layer transport`);
+    const reel = document.createElement("span");
+    reel.className = "reel";
+    reel.setAttribute("aria-hidden", "true");
+    const label = document.createElement("b");
+    label.textContent = name;
+    const count = document.createElement("span");
+    count.className = "tcount";
+    count.setAttribute("aria-hidden", "true");
+    count.textContent = "000";
+    const btn = (act, text, aria) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "mini";
+      b.dataset.la = act;
+      b.textContent = text;
+      b.setAttribute("aria-label", `${aria} ${name}`);
+      return b;
+    };
+    const play = btn("play", "▶", "Play in sync:");
+    const loop = btn("loop", "⟲", "Loop on its own:");
+    const stop = btn("stop", "■", "Stop:");
+    const rew = btn("rew", "◀◀", "Rewind to the top of the loop:");
+    const win = document.createElement("select");
+    win.setAttribute("aria-label", `${name} loop length`);
+    for (const w of LOOP_WINDOWS) win.add(new Option(w.label, w.id));
+    win.add(new Option("custom", "custom"));
+    const custom = document.createElement("span");
+    custom.className = "lcustom";
+    const num = (aria) => {
+      const i = document.createElement("input");
+      i.type = "number";
+      i.min = "1";
+      i.max = "32";
+      i.setAttribute("aria-label", `${name} loop ${aria} step`);
+      return i;
+    };
+    const ls = num("start");
+    const le = num("end");
+    custom.append(ls, "–", le);
+    const status = document.createElement("span");
+    status.className = "lstat hint";
+    row.append(reel, label, count, play, loop, stop, rew, win, custom, status);
+    play.addEventListener("click", () => layerAction(t, "play"));
+    loop.addEventListener("click", () => layerAction(t, "loop"));
+    stop.addEventListener("click", () => layerAction(t, "stop"));
+    rew.addEventListener("click", () => layerAction(t, "rew"));
+    win.addEventListener("change", () => {
+      const w = LOOP_WINDOWS.find((x) => x.id === win.value);
+      if (w) setLayerWindow(t, w.start, w.end);
+      else renderDeckRow(t, true);
+    });
+    const onCustom = () => setLayerWindow(t, (Number(ls.value) || 1) - 1, Number(le.value) || 16);
+    ls.addEventListener("change", onCustom);
+    le.addEventListener("change", onCustom);
+    root.appendChild(row);
+    return { row, count, play, loop, stop, win, custom, ls, le, status };
+  });
+  $("deck-all").addEventListener("click", syncAll);
+  $("deck-panel").addEventListener("toggle", () => { renderDeck(); renderCounters(); });
+  renderDeck();
+}
+
+function renderDeckRow(t, forceCustom = false) {
+  const r = deckRows[t];
+  if (!r) return;
+  const l = layers[t];
+  const q = layerQueue.get(t);
+  const pending = q?.mode || (q?.rew ? "rew" : syncQueued ? "play" : null);
+  const rolling = state.playing && l.mode !== "stop";
+  r.row.classList.toggle("rolling", rolling);
+  r.row.classList.toggle("stopped", l.mode === "stop");
+  for (const [b, m] of [[r.play, "play"], [r.loop, "loop"], [r.stop, "stop"]]) {
+    b.classList.toggle("on", l.mode === m);
+    b.classList.toggle("queued", pending === m);
+    b.setAttribute("aria-pressed", String(l.mode === m));
+  }
+  const id = forceCustom ? "custom" : windowId(l);
+  r.win.value = id;
+  r.custom.hidden = id !== "custom";
+  r.ls.value = String(l.start + 1);
+  r.le.value = String(l.end);
+  r.status.textContent = pending ? `${pending === "rew" ? "rewind" : pending} at next bar` : l.mode === "loop" ? `loop ${l.start + 1}–${l.end}` : "";
+}
+
+function renderDeck() {
+  for (let t = 0; t < deckRows.length; t++) renderDeckRow(t);
+  const all = $("deck-all");
+  if (all) all.classList.toggle("queued", syncQueued);
+  const tape = $("tape");
+  if (tape) {
+    tape.classList.toggle("on", state.tape);
+    tape.setAttribute("aria-pressed", String(state.tape));
+  }
+}
+
+// Tape counters: the layer's pass through its loop (or bars since PLAY).
+function renderCounters() {
+  if (!deckOpen()) return;
+  layers.forEach((l, t) => {
+    const r = deckRows[t];
+    if (!r) return;
+    let n = 0;
+    if (state.playing) {
+      const len = l.mode === "loop" ? Math.max(1, l.end - l.start) : BAR_STEPS;
+      n = Math.floor(Math.max(0, absStep - (l.mode === "loop" ? l.origin : 0)) / len) + 1;
+    }
+    r.count.textContent = String(n % 1000).padStart(3, "0");
+  });
+}
+
+/** Layers for an export: as they are now, with every loop starting at the top. */
+function exportLayers() {
+  return layers.map((l) => ({ ...l, origin: 0 }));
 }
 
 // ---- Mixer ----
@@ -2250,6 +2504,14 @@ function bind() {
     studio.setLimiter(state.limiter);
     $("limiter").classList.toggle("on", state.limiter);
   });
+  $("tape").addEventListener("click", () => {
+    state.tape = !state.tape;
+    if (studio.armed) studio.setTape(state.tape);
+    else studio.tapeOn = state.tape;
+    renderDeck();
+    scheduleAutosave();
+    showSnack(state.tape ? "TAPE on: wow, flutter, warm saturation and hiss (still speaker-safe)" : "TAPE off");
+  });
   $("crt").addEventListener("click", () => {
     state.crt = !state.crt;
     document.body.classList.toggle("crt", state.crt);
@@ -2385,6 +2647,7 @@ initSeqEvents();
 initBanks();
 initInspector();
 initMixer();
+initDeck();
 void initSamples();
 initMidi();
 renderPaint();
@@ -2413,6 +2676,6 @@ if ("serviceWorker" in navigator && location.protocol !== "file:") {
 }
 void loadShareFromHash();
 if (!restored && !fromLink) {
-  showSnack("Four classic 808 sections are loaded: tap ▶ LOOP on A–D, or ▶ SONG for A A B B C D");
+  showSnack("A classic 808 trap beat is loaded: press PLAY (or ▶ LOOP on A). B–D are rage, dark and fill; ▶ SONG plays A A B A C D");
 }
 $("toast").textContent = "Your beat autosaves in this browser and the app works offline once loaded. SHARE makes a link that opens this exact beat; EXPORT WAV renders a clean file. Keys: A–' synth (W E T Y U O P are the black keys), 1–8 drums, Space play/stop, Ctrl/Cmd+Z undo, Shift+Ctrl/Cmd+Z redo.";

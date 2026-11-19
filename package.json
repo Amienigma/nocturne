@@ -4,7 +4,7 @@
   "type": "module",
   "description": "NOCTURNE \u00d7 808 PIT \u2014 browser beat lab",
   "scripts": {
-    "test": "node --test test/smoke.mjs test/state-io.test.mjs test/wav-ai.test.mjs test/phase3.test.mjs test/samples-midi.test.mjs test/classics.test.mjs test/loudness.test.mjs",
+    "test": "node --test test/smoke.mjs test/state-io.test.mjs test/wav-ai.test.mjs test/phase3.test.mjs test/samples-midi.test.mjs test/classics.test.mjs test/rolls-deck.test.mjs test/loudness.test.mjs",
     "start": "python3 -m http.server 4173",
     "test:e2e": "node --test --test-concurrency=1 test/e2e.test.mjs test/sections.e2e.test.mjs"
   },

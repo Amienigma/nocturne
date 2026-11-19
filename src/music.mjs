@@ -342,10 +342,32 @@ export function pitWaveFromSource(source) {
 }
 
 // Per-step trap features (v2). Defaults reproduce v1 behaviour exactly.
-export const RATCHETS = [1, 2, 3, 4, 6]; // hits per step: 1, 1/2, 1/3, 1/4, 1/6 rolls
+// Rolls, as hits per step (append-only: share links store the index, 3 bits).
+// 2 = 1/32, 3 = 1/48 (16th triplets), 4 = 1/64, 6 = 1/96, 8 = 1/128 stutter;
+// 1.5 = 1/24 triplet run (3 hits over 2 steps), 0.75 = 1/12 triplet run (3 over 4 steps).
+export const RATCHETS = [1, 2, 3, 4, 6, 1.5, 0.75, 8];
+export const ROLL_LABELS = { 1: "off", 2: "1/32 ×2", 3: "1/48 ×3", 4: "1/64 ×4", 6: "1/96 ×6", 8: "1/128 ×8", 1.5: "1/24 trip (3 over 2 steps)", 0.75: "1/12 trip (3 over 4 steps)" };
+/** How a roll value plays: `hits` evenly spaced over `span` steps. */
+export function rollShape(rat) {
+  if (rat === 1.5) return { hits: 3, span: 2 };
+  if (rat === 0.75) return { hits: 3, span: 4 };
+  return RATCHETS.includes(rat) && rat > 1 ? { hits: rat, span: 1 } : { hits: 1, span: 1 };
+}
+// Roll ramps (append-only index): velocity and pitch (semitones) across a roll,
+// so it "rolls" instead of repeating one static hit. Pitch applies to the
+// TR-808 kit voices.
+export const RAMPS = [
+  { id: "none", label: "none", vel: 0, pitch: 0 },
+  { id: "up", label: "louder ↗", vel: 1, pitch: 0 },
+  { id: "down", label: "softer ↘", vel: -1, pitch: 0 },
+  { id: "rise", label: "pitch up ⤴", vel: 0, pitch: 5 },
+  { id: "fall", label: "pitch down ⤵", vel: 0, pitch: -5 },
+  { id: "riseup", label: "louder + pitch up", vel: 1, pitch: 7 },
+  { id: "falldown", label: "softer + pitch down", vel: -1, pitch: -7 },
+];
 export const PROBS = [1, 0.75, 0.5, 0.25]; // chance the step plays
-export const GATES = [0, 0.5, 1, 2, 4, 8]; // note length in steps; 0 = sound's own length
-export const STEP_DEFAULTS = Object.freeze({ rat: 1, prob: 1, slide: false, gate: 0 });
+export const GATES = [0, 0.5, 1, 2, 4, 8, 12, 16]; // note length in steps; 0 = sound's own length. Append-only (share links store the index; 3 bits = 8 max)
+export const STEP_DEFAULTS = Object.freeze({ rat: 1, prob: 1, slide: false, gate: 0, ramp: 0 });
 
 export function emptyCell(name) {
   return { on: false, vel: 0.85, note: DEFAULT_NOTES[name], chordId: name === "Synth" ? "mystic" : "cm", ...STEP_DEFAULTS };
