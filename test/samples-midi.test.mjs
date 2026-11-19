@@ -40,9 +40,12 @@ test("samples: long input is cut to 10 s, high rates downsampled, silence reject
   assert.ok(!validRecord({ name: "x", rate: 1, pcm: new Int16Array(1) }));
 });
 
-test("sample sources are appended last, so older share-link indexes don't move", () => {
-  assert.equal(SOURCE_GROUPS[SOURCE_GROUPS.length - 1].label, "Your samples");
-  assert.equal(SOURCE_IDS[SOURCE_IDS.length - 8], "smp:1");
+test("sample + TR-808 sources are appended last, so older share-link indexes don't move", () => {
+  // Phase 3b appended "Your samples"; the classic TR-808 kit is appended after it.
+  assert.equal(SOURCE_GROUPS[SOURCE_GROUPS.length - 2].label, "Your samples");
+  assert.equal(SOURCE_GROUPS[SOURCE_GROUPS.length - 1].label, "TR-808 classic");
+  assert.equal(SOURCE_IDS.indexOf("smp:1"), 79);
+  assert.equal(SOURCE_IDS.indexOf("tr:BD"), 87);
   assert.equal(SOURCE_IDS.indexOf("pit:808"), 0);
   assert.equal(sampleSlotFromSource("smp:3"), 3);
   assert.equal(sampleSlotFromSource("smp:9"), 0);

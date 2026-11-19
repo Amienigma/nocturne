@@ -206,6 +206,17 @@
     .smp .acts { display: flex; gap: 4px; flex-wrap: wrap; }
     .smp .acts .mini { padding: 4px 7px; }
     .smp .mini.rec.on { background: #e5484d; border-color: #e5484d; color: #fff; }
+    .sections { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; margin-top: 10px; }
+    @media (min-width: 700px) { .sections { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+    .sec { display: grid; grid-template-columns: auto minmax(0, 1fr); grid-template-rows: auto auto; gap: 4px 6px; align-items: center; border: 1px solid var(--border); background: var(--card); border-radius: 10px; padding: 6px; min-width: 0; }
+    .sec.playing { border-color: var(--cyan); }
+    .sec .pbank { grid-row: 1 / 3; min-width: 40px; min-height: 44px; font-size: 16px; font-weight: 700; }
+    .sec .sec-loop { min-height: 30px; white-space: nowrap; }
+    .sec .sec-loop.on { background: var(--cyan); color: #111; }
+    .sec-name { color: var(--muted); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #song { font-weight: 700; }
+    #song.on { border-color: var(--cyan); }
+    .chain-add { display: inline-flex; gap: 3px; }
     .chain { display: inline-flex; flex-wrap: wrap; gap: 3px; }
     .chain .mini { padding: 4px 7px; }
     .chain .mini.now { background: var(--cyan); color: #111; }
@@ -355,20 +366,48 @@
         <button class="btn" id="slot-load" type="button">LOAD</button>
         <button class="btn" id="slot-del" type="button">DELETE</button>
       </div>
-      <div class="bank-bar" id="bank-bar" role="group" aria-label="Pattern banks and song">
-        <span class="hint">BANK</span>
-        <button class="mini pbank" data-pbank="0" type="button" aria-label="Bank A">A</button>
-        <button class="mini pbank" data-pbank="1" type="button" aria-label="Bank B">B</button>
-        <button class="mini pbank" data-pbank="2" type="button" aria-label="Bank C">C</button>
-        <button class="mini pbank" data-pbank="3" type="button" aria-label="Bank D">D</button>
-        <button class="mini" id="bank-copy" type="button">COPY</button>
-        <button class="mini" id="bank-paste" type="button" disabled>PASTE</button>
-        <button class="mini" id="song" type="button" aria-pressed="false">SONG</button>
-        <span class="chain" id="chain" role="group" aria-label="Song chain"></span>
-        <button class="mini" id="chain-add" type="button" aria-label="Add current bank to the song chain">+</button>
-        <button class="mini" id="chain-del" type="button" aria-label="Remove the last bank from the song chain">−</button>
-        <span class="hint" id="bank-status" role="status" aria-live="polite"></span>
-      </div>
+      <section class="sections-wrap" aria-label="Sections and song">
+        <div class="sections" id="sections" role="group" aria-label="Sections A to D">
+          <div class="sec" data-sec="0">
+            <button class="mini pbank" data-pbank="0" type="button" aria-label="Edit section A">A</button>
+            <button class="mini sec-loop" data-loop="0" type="button" aria-pressed="false" aria-label="Loop section A">▶ LOOP</button>
+            <small class="sec-name" aria-hidden="true"></small>
+          </div>
+          <div class="sec" data-sec="1">
+            <button class="mini pbank" data-pbank="1" type="button" aria-label="Edit section B">B</button>
+            <button class="mini sec-loop" data-loop="1" type="button" aria-pressed="false" aria-label="Loop section B">▶ LOOP</button>
+            <small class="sec-name" aria-hidden="true"></small>
+          </div>
+          <div class="sec" data-sec="2">
+            <button class="mini pbank" data-pbank="2" type="button" aria-label="Edit section C">C</button>
+            <button class="mini sec-loop" data-loop="2" type="button" aria-pressed="false" aria-label="Loop section C">▶ LOOP</button>
+            <small class="sec-name" aria-hidden="true"></small>
+          </div>
+          <div class="sec" data-sec="3">
+            <button class="mini pbank" data-pbank="3" type="button" aria-label="Edit section D">D</button>
+            <button class="mini sec-loop" data-loop="3" type="button" aria-pressed="false" aria-label="Loop section D">▶ LOOP</button>
+            <small class="sec-name" aria-hidden="true"></small>
+          </div>
+        </div>
+        <div class="bank-bar" id="bank-bar" role="group" aria-label="Song chain">
+          <button class="mini" id="song" type="button" aria-pressed="false">▶ SONG</button>
+          <span class="chain" id="chain" role="group" aria-label="Song chain"></span>
+          <span class="chain-add" role="group" aria-label="Add a section to the end of the song">
+            <button class="mini" data-append="0" type="button" aria-label="Add section A to the song">+A</button>
+            <button class="mini" data-append="1" type="button" aria-label="Add section B to the song">+B</button>
+            <button class="mini" data-append="2" type="button" aria-label="Add section C to the song">+C</button>
+            <button class="mini" data-append="3" type="button" aria-label="Add section D to the song">+D</button>
+          </span>
+          <button class="mini" id="chain-del" type="button" aria-label="Remove the last section from the song">⌫</button>
+          <button class="mini" id="chain-clear" type="button" aria-label="Clear the song chain">CLEAR</button>
+        </div>
+        <div class="bank-bar">
+          <button class="mini" id="bank-copy" type="button" aria-label="Copy the section you are editing">COPY</button>
+          <button class="mini" id="bank-paste" type="button" disabled aria-label="Paste into the section you are editing">PASTE</button>
+          <button class="mini" id="classic-load" type="button" title="Reload the four classic TR-808 sections (undoable)">LOAD CLASSIC 808</button>
+          <span class="hint" id="bank-status" role="status" aria-live="polite"></span>
+        </div>
+      </section>
       <div class="track-bar" id="track-bar">
         <button class="btn arrow" id="trk-prev" type="button" aria-label="Previous track">◀</button>
         <select id="trk-pick" aria-label="Track"></select>
@@ -377,7 +416,7 @@
         <button class="ms" id="trk-solo" type="button" aria-label="Solo selected track">S</button>
         <select id="trk-src" aria-label="Sound for selected track"></select>
       </div>
-      <p class="hint">Banks A–D hold four patterns; while playing, a new bank starts at the next loop. SONG plays the chain (tap a chain chip to change it). Tap a step, then use the step bar for velocity, rolls (1/2–1/6), chance, length and 808 slide (glides from the previous note). Select a track, pick a note or chord, then tap steps. On a phone you see one track at a time: swipe or use ◀ ▶ to switch ([ and ] on a keyboard). Hold, right-click or shift-click a step to cycle its velocity (40 → 60 → 80 → 100%); brighter = louder. Everything autosaves; CLEAR, RANDOMIZE and presets can be undone. 808 and chord tracks store a pitch per step.</p>
+      <p class="hint">Sections A–D are four patterns (fresh sessions start with classic 808 grooves: A electro, B trap, C Miami bass, D breakdown + fill). ▶ LOOP plays one section on repeat; tap another section while playing and it takes over at the next bar. ▶ SONG plays the chain in order and loops it; build it with +A–D, ⌫ removes the last part, CLEAR empties it, and tapping a chain chip changes that part. Switching between a section loop and the song never stops the beat. Tap a section letter to edit it; LOAD CLASSIC 808 brings the classic sections back (undoable). Tap a step, then use the step bar for velocity, rolls (1/2–1/6), chance, length and 808 slide (glides from the previous note). Select a track, pick a note or chord, then tap steps. On a phone you see one track at a time: swipe or use ◀ ▶ to switch ([ and ] on a keyboard). Hold, right-click or shift-click a step to cycle its velocity (40 → 60 → 80 → 100%); brighter = louder. Everything autosaves; CLEAR, RANDOMIZE and presets can be undone. 808 and chord tracks store a pitch per step.</p>
       <div class="note-strip" id="paint-notes"></div>
       <div class="seq-wrap" id="seq-wrap">
         <div class="seq" id="seq" role="group" aria-label="Steps: arrow keys move, Enter or Space toggles"></div>

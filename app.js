@@ -35,7 +35,6 @@ import {
   REL_MAX,
   cycleStepVelocity,
   setStepProps,
-  emptyPattern,
 } from "./src/music.mjs";
 import {
   serializeState,
@@ -58,7 +57,8 @@ import {
   toStored,
   fromStored,
 } from "./src/state-io.mjs";
-import { stepHits, bankForLoop } from "./src/sequencer.mjs";
+import { stepHits } from "./src/sequencer.mjs";
+import { classicBanks, classicMixer, classicState, CLASSIC_BPM, CLASSIC_SWING, CLASSIC_CHAIN, CLASSIC_SECTIONS } from "./src/classics.mjs";
 import { SAMPLE_SLOTS, MAX_FILE_BYTES, MAX_SAMPLE_SEC, prepareSample, loadSamples, saveSample, deleteSample } from "./src/samples.mjs";
 import { midiSupported, connectMidi, drumTrackForNote } from "./src/midi.mjs";
 import { renderWav, EXPORT_BARS } from "./src/export.mjs";
@@ -71,18 +71,20 @@ const state = withPatternAlias({
   hitBank: "atlanta",
   armed: false,
   playing: false,
-  bpm: 100,
-  swing: 0,
+  bpm: CLASSIC_BPM,
+  swing: CLASSIC_SWING,
   length: 16,
-  // Pattern banks A–D; `state.pattern` is an alias for banks[bank].
-  banks: [applyPreset("ATLANTA NIGHT"), emptyPattern(32), emptyPattern(32), emptyPattern(32)],
+  // Pattern banks A–D; `state.pattern` is an alias for banks[bank]. A fresh
+  // session (no autosave, no share link) starts with four classic TR-808
+  // sections; saved beats replace them in loadAutosave() / share links.
+  banks: classicBanks(),
   bank: 0,
-  chain: [0],
+  chain: [...CLASSIC_CHAIN],
   song: false,
-  mixer: TRACKS.map(defaultMix),
-  focusStep: { t: 6, s: 0 },
-  preset: "ATLANTA NIGHT",
-  selectedTrack: 6,
+  mixer: classicMixer(),
+  focusStep: { t: 0, s: 0 },
+  preset: null,
+  selectedTrack: 0,
   paintNote: 36,
   paintChord: "cm",
   hatDiv: "1/16",
@@ -142,6 +144,7 @@ function applyState(raw, { keepMetronome = false, keepPatch = false } = {}) {
   state.song = s.song;
   state.mixer = s.mixer;
   queuedBank = null;
+  queuedMode = null;
   if (!keepMetronome) state.metronome = s.metronome;
   studio.setPatch(state.patch);
   studio.setLimiter(state.limiter);
@@ -868,7 +871,10 @@ function renderPaint() {
       btn.textContent = noteName(midi);
       btn.addEventListener("click", () => {
         state.paintNote = midi;
-        if (arm()) studio.firePit(midi, studio.ctx.currentTime, 0.8, pitWaveFromSource(source) || state.patch.wave, 0.25);
+        if (arm()) {
+          if (source === "tr:TOM") studio.play808("TOM", studio.ctx.currentTime, 0.8, midi);
+          else studio.firePit(midi, studio.ctx.currentTime, 0.8, pitWaveFromSource(source) || state.patch.wave, 0.25);
+        }
         renderPaint();
       });
       root.appendChild(btn);
@@ -1229,8 +1235,17 @@ let timer = 0;
 let nextTime = 0;
 let stepIndex = 0;
 let absStep = 0; // steps since PLAY, for bar-accurate metronome accents
-let loopCount = 0; // pattern loops since PLAY (song position)
-let queuedBank = null; // bank picked while playing; starts at the next loop
+let songPos = 0; // index into state.chain while the song plays
+let queuedBank = null; // section picked while playing; starts at the next bar
+let queuedMode = null; // "song" | "loop": mode switch waiting for the next bar
+const BAR_STEPS = 16;
+// Last few section switches ({ step, bank, song, why }), for tests/debugging.
+const transportLog = [];
+function logSwitch(bank, why) {
+  transportLog.push({ step: absStep, bank, song: state.song, why });
+  if (transportLog.length > 64) transportLog.shift();
+}
+window.__nocturneTransport = () => ({ playing: state.playing, absStep, stepIndex, songPos, queuedBank, queuedMode, bank: state.bank, song: state.song, log: transportLog.slice() });
 const lightTimers = new Set();
 
 function outputDelay() {
@@ -1272,10 +1287,19 @@ function scheduler() {
   if (!state.playing || !studio.ctx) return;
   const stepSec = 60 / state.bpm / 4;
   while (nextTime < studio.ctx.currentTime + 0.12) {
+    if (absStep > 0) {
+      // Section / mode changes land on the next bar line (every 16 steps), so
+      // everything stays in time; the new section starts from its step 1.
+      if (absStep % BAR_STEPS === 0 && (queuedBank != null || queuedMode)) {
+        applyQueued(nextTime);
+        stepIndex = 0;
+      } else if (stepIndex === 0 && state.song) {
+        advanceSong(nextTime);
+      }
+    }
     const step = stepIndex % state.length;
     const swing = step % 2 === 1 ? (state.swing / 100) * stepSec * 0.5 : 0;
     const when = nextTime + swing;
-    if (step === 0 && absStep > 0) loopBoundary(nextTime);
     for (const h of stepHits(state.pattern, step, stepSec)) {
       studio.triggerSource(h.source, h.cell, when + h.at, h.vel, h.opts);
     }
@@ -1308,10 +1332,12 @@ function setPlaying(on, startAt = null) {
     if (startAt == null) nextTime = studio.ctx.currentTime + 0.05;
     stepIndex = 0;
     absStep = 0;
-    loopCount = 0;
-    if (state.song) switchBank(bankForLoop(state, 0));
+    songPos = 0;
+    transportLog.length = 0;
+    if (state.song && state.chain.length) switchBank(state.chain[0]);
     else if (queuedBank != null) switchBank(queuedBank);
     queuedBank = null;
+    queuedMode = null;
     renderBanks();
     timer = window.setInterval(scheduler, 25);
     kickScope();
@@ -1320,6 +1346,7 @@ function setPlaying(on, startAt = null) {
     clearLights();
     state.currentStep = -1;
     queuedBank = null;
+    queuedMode = null;
     renderBanks();
     // The AudioContext suspends itself once tails have rung out (studio idle check).
     studio.lastUse = performance.now();
@@ -1342,7 +1369,7 @@ function renderInspector() {
   const row = state.pattern[t];
   const cell = row?.steps[s];
   if (!cell) return;
-  const melodic = sourceIsMelodic(row.source) && !sourceIsChord(row.source);
+  const melodic = sourceIsMelodic(row.source) && !sourceIsChord(row.source) && !row.source.startsWith("tr:");
   $("insp-title").textContent = `${TRACKS[t].toUpperCase()} · STEP ${s + 1}${cell.on ? "" : " (off)"}`;
   $("insp").classList.toggle("off", !cell.on);
   $("insp-vel").value = String(cell.vel);
@@ -1384,7 +1411,10 @@ function initInspector() {
   });
 }
 
-// ---- Pattern banks A–D and song chain ----
+// ---- Sections (pattern banks A–D), solo loops and the song chain ----
+// Each section can loop on its own (▶ LOOP) or the chain plays them in order
+// (▶ SONG). While playing, any switch (section → section, loop ↔ song) is
+// queued to the next bar line so the groove never drops a beat.
 let bankClipboard = null;
 
 function switchBank(b) {
@@ -1396,34 +1426,111 @@ function switchBank(b) {
   scheduleAutosave();
 }
 
-function pickBank(b) {
-  if (state.playing && !state.song) {
-    queuedBank = b === state.bank ? null : b;
-    renderBanks();
-    return;
-  }
-  switchBank(b);
-}
-
-// Called by the scheduler when a pattern loop wraps (at audio time `when`).
-function loopBoundary(when) {
-  loopCount += 1;
-  let next = null;
-  if (state.song) next = bankForLoop(state, loopCount);
-  else if (queuedBank != null) next = queuedBank;
-  queuedBank = null;
+/** Point playback at bank `next` from audio time `when`; the grid follows when it's heard. */
+function setAudioBank(next, when) {
   if (next == null || next === state.bank) {
-    if (state.song) queueUi(when, renderBanks);
+    queueUi(when, renderBanks);
     return;
   }
-  // The audio switches now (the scheduler reads state.pattern); the grid
-  // follows when the new loop is actually heard.
   state.bank = next;
   queueUi(when, () => {
     renderSeq();
     renderInspector();
     renderBanks();
   });
+}
+
+// Called by the scheduler on a bar line with something queued.
+function applyQueued(when) {
+  let next = state.bank;
+  if (queuedMode === "song") {
+    state.song = true;
+    songPos = 0;
+    if (state.chain.length) next = state.chain[0];
+  } else {
+    if (queuedMode === "loop") state.song = false;
+    if (queuedBank != null) next = queuedBank;
+  }
+  queuedBank = null;
+  queuedMode = null;
+  logSwitch(next, "bar");
+  setAudioBank(next, when);
+  scheduleAutosave();
+}
+
+// Called by the scheduler when the pattern wraps in song mode.
+function advanceSong(when) {
+  if (!state.chain.length) return;
+  songPos = (songPos + 1) % state.chain.length;
+  logSwitch(state.chain[songPos], "song");
+  setAudioBank(state.chain[songPos], when);
+}
+
+/** ▶ LOOP on a section: start it looping, queue it while playing, or stop it. */
+function loopSection(b) {
+  if (b < 0 || b >= PATTERN_BANKS) return;
+  if (state.playing) {
+    const loopingThis = !state.song && state.bank === b;
+    if (loopingThis && queuedBank == null && !queuedMode) {
+      setPlaying(false);
+      return;
+    }
+    queuePick(b);
+    return;
+  }
+  cancelCountIn();
+  if (state.song) commit(() => { state.song = false; });
+  switchBank(b);
+  setPlaying(true);
+}
+
+// While playing: loop section `b` from the next bar (leaving the song if needed).
+function queuePick(b) {
+  if (state.song) {
+    queuedMode = "loop";
+    queuedBank = b;
+  } else {
+    queuedMode = null;
+    queuedBank = b === state.bank ? null : b;
+  }
+  renderBanks();
+}
+
+/** ▶ SONG: play the chain, switch to it at the next bar, or stop it. */
+function songButton() {
+  if (!state.chain.length) {
+    showSnack("The song is empty: tap +A, +B, +C or +D to add sections");
+    return;
+  }
+  if (!state.playing) {
+    cancelCountIn();
+    if (!state.song) commit(() => { state.song = true; });
+    setPlaying(true);
+    return;
+  }
+  if (queuedMode === "song") {
+    queuedMode = null; // tapped again before the bar: cancel
+  } else if (state.song) {
+    if (queuedMode === "loop") {
+      queuedMode = null;
+      queuedBank = null;
+    } else {
+      setPlaying(false);
+      return;
+    }
+  } else {
+    queuedMode = "song";
+    queuedBank = null;
+  }
+  renderBanks();
+}
+
+function pickBank(b) {
+  if (state.playing) {
+    queuePick(b);
+    return;
+  }
+  switchBank(b);
 }
 
 function queueUi(when, fn) {
@@ -1435,33 +1542,85 @@ function queueUi(when, fn) {
   lightTimers.add(id);
 }
 
+// Section labels: the classic name while a bank still holds its classic
+// groove. Cached per pattern object (patterns are replaced on every edit).
+const sectionLabels = new WeakMap();
+let classicSigs = null;
+function sectionLabel(b) {
+  const p = state.banks[b];
+  if (!p) return "";
+  let label = sectionLabels.get(p);
+  if (label == null) {
+    classicSigs ??= classicBanks().map((x) => JSON.stringify(x));
+    const empty = p.every((row) => row.steps.every((c) => !c.on));
+    label = empty ? "empty" : JSON.stringify(p) === classicSigs[b] ? CLASSIC_SECTIONS[b].name : "edited";
+    sectionLabels.set(p, label);
+  }
+  return label;
+}
+
 function renderBanks() {
+  const playing = state.playing;
+  const playBank = state.bank;
   document.querySelectorAll("[data-pbank]").forEach((el) => {
     const b = Number(el.dataset.pbank);
     el.classList.toggle("on", b === state.bank);
     el.classList.toggle("queued", b === queuedBank);
     el.setAttribute("aria-pressed", String(b === state.bank));
   });
-  $("song").classList.toggle("on", state.song);
-  $("song").setAttribute("aria-pressed", String(state.song));
+  document.querySelectorAll("[data-loop]").forEach((el) => {
+    const b = Number(el.dataset.loop);
+    const looping = playing && !state.song && b === playBank;
+    const queued = b === queuedBank;
+    el.classList.toggle("on", looping);
+    el.classList.toggle("queued", queued);
+    el.setAttribute("aria-pressed", String(looping));
+    el.textContent = looping ? "■ STOP" : queued ? "◷ NEXT BAR" : "▶ LOOP";
+    el.setAttribute("aria-label", looping ? `Stop looping section ${BANK_NAMES[b]}` : `Loop section ${BANK_NAMES[b]}${playing ? " from the next bar" : ""}`);
+    const card = el.closest(".sec");
+    if (card) {
+      card.classList.toggle("playing", playing && b === playBank);
+      const name = card.querySelector(".sec-name");
+      if (name) name.textContent = sectionLabel(b);
+    }
+  });
+  const songBtn = $("song");
+  const songPlaying = playing && state.song;
+  songBtn.classList.toggle("on", state.song);
+  songBtn.classList.toggle("queued", queuedMode === "song");
+  songBtn.setAttribute("aria-pressed", String(state.song));
+  songBtn.textContent = songPlaying && queuedMode !== "loop" ? "■ SONG" : queuedMode === "song" ? "◷ SONG" : "▶ SONG";
+  songBtn.setAttribute("aria-label", songPlaying ? "Stop the song" : playing ? "Play the song from the next bar" : "Play the song (sections in chain order, looping)");
+  songBtn.disabled = !state.chain.length;
   $("bank-paste").disabled = !bankClipboard;
   const chain = $("chain");
   chain.innerHTML = "";
-  const pos = state.playing && state.song ? loopCount % state.chain.length : -1;
+  const pos = songPlaying && state.chain.length ? songPos % state.chain.length : -1;
   state.chain.forEach((b, i) => {
     const chip = document.createElement("button");
     chip.type = "button";
     chip.className = `mini${i === pos ? " now" : ""}`;
     chip.textContent = BANK_NAMES[b];
     chip.dataset.ci = String(i);
-    chip.setAttribute("aria-label", `Song part ${i + 1}: bank ${BANK_NAMES[b]}. Activate to change`);
+    chip.setAttribute("aria-label", `Song part ${i + 1} of ${state.chain.length}: section ${BANK_NAMES[b]}${i === pos ? ", playing" : ""}. Activate to change`);
     chain.appendChild(chip);
   });
-  $("chain-add").disabled = state.chain.length >= CHAIN_MAX;
-  $("chain-del").disabled = state.chain.length <= 1;
-  $("bank-status").textContent = queuedBank != null
-    ? `Bank ${BANK_NAMES[queuedBank]} starts next loop`
-    : state.song ? `Song: ${state.chain.length} part${state.chain.length === 1 ? "" : "s"}` : "";
+  if (!state.chain.length) {
+    const empty = document.createElement("span");
+    empty.className = "hint";
+    empty.textContent = "empty: tap +A–D";
+    chain.appendChild(empty);
+  }
+  document.querySelectorAll("[data-append]").forEach((el) => { el.disabled = state.chain.length >= CHAIN_MAX; });
+  $("chain-del").disabled = state.chain.length === 0;
+  $("chain-clear").disabled = state.chain.length === 0;
+  let status = "";
+  if (queuedMode === "song") status = "Song starts at the next bar";
+  else if (queuedBank != null) status = `Section ${BANK_NAMES[queuedBank]} loops from the next bar`;
+  else if (songPlaying) status = `Song: part ${pos + 1} of ${state.chain.length} (loops)`;
+  else if (playing) status = `Looping section ${BANK_NAMES[playBank]}`;
+  else if (state.song) status = `Song: ${state.chain.length} part${state.chain.length === 1 ? "" : "s"}`;
+  $("bank-status").textContent = status;
   const bars = $("exp-bars");
   if (bars) {
     bars.disabled = state.song;
@@ -1469,46 +1628,59 @@ function renderBanks() {
   }
 }
 
+function setChain(next) {
+  commit(() => { state.chain = next; });
+  if (songPos >= next.length) songPos = 0;
+  renderBanks();
+}
+
+function loadClassics() {
+  commit(() => applyState(classicState(), { keepMetronome: true, keepPatch: true }), "Loaded the classic 808 sections");
+  saveNow();
+}
+
 function initBanks() {
   document.querySelectorAll("[data-pbank]").forEach((el) => {
     el.addEventListener("click", () => pickBank(Number(el.dataset.pbank)));
   });
+  document.querySelectorAll("[data-loop]").forEach((el) => {
+    el.addEventListener("click", () => loopSection(Number(el.dataset.loop)));
+  });
   $("bank-copy").addEventListener("click", () => {
     bankClipboard = JSON.parse(JSON.stringify(state.pattern));
     renderBanks();
-    showSnack(`Bank ${BANK_NAMES[state.bank]} copied`);
+    showSnack(`Section ${BANK_NAMES[state.bank]} copied`);
   });
   $("bank-paste").addEventListener("click", () => {
     if (!bankClipboard) return;
     const copy = JSON.parse(JSON.stringify(bankClipboard));
-    commit(() => { state.pattern = copy; }, `Pasted into bank ${BANK_NAMES[state.bank]}`);
+    commit(() => { state.pattern = copy; }, `Pasted into section ${BANK_NAMES[state.bank]}`);
     renderSeq();
     renderInspector();
-  });
-  $("song").addEventListener("click", () => {
-    commit(() => { state.song = !state.song; });
-    if (state.song && state.playing) queuedBank = null;
     renderBanks();
   });
+  $("song").addEventListener("click", songButton);
   $("chain").addEventListener("click", (e) => {
     const chip = e.target.closest?.("[data-ci]");
     if (!chip) return;
     const i = Number(chip.dataset.ci);
-    commit(() => {
-      state.chain = state.chain.map((b, j) => (j === i ? (b + 1) % PATTERN_BANKS : b));
-    });
-    renderBanks();
+    setChain(state.chain.map((b, j) => (j === i ? (b + 1) % PATTERN_BANKS : b)));
   });
-  $("chain-add").addEventListener("click", () => {
-    if (state.chain.length >= CHAIN_MAX) return;
-    commit(() => { state.chain = [...state.chain, state.bank]; });
-    renderBanks();
+  document.querySelectorAll("[data-append]").forEach((el) => {
+    el.addEventListener("click", () => {
+      if (state.chain.length >= CHAIN_MAX) return;
+      setChain([...state.chain, Number(el.dataset.append)]);
+    });
   });
   $("chain-del").addEventListener("click", () => {
-    if (state.chain.length <= 1) return;
-    commit(() => { state.chain = state.chain.slice(0, -1); });
-    renderBanks();
+    if (!state.chain.length) return;
+    setChain(state.chain.slice(0, -1));
   });
+  $("chain-clear").addEventListener("click", () => {
+    setChain([]);
+    showSnack("Song cleared: tap +A, +B, +C, +D to build it", true);
+  });
+  $("classic-load").addEventListener("click", loadClassics);
 }
 
 // ---- Mixer ----
@@ -2222,7 +2394,8 @@ studio.setMixer(state.mixer);
 renderBanks();
 renderMixer();
 renderInspector();
-loadAutosave();
+const restored = loadAutosave();
+const fromLink = Boolean(shareCodeFromHash(location.hash));
 syncControls();
 renderSlots();
 renderUndo();
@@ -2239,4 +2412,7 @@ if ("serviceWorker" in navigator && location.protocol !== "file:") {
   });
 }
 void loadShareFromHash();
+if (!restored && !fromLink) {
+  showSnack("Four classic 808 sections are loaded: tap ▶ LOOP on A–D, or ▶ SONG for A A B B C D");
+}
 $("toast").textContent = "Your beat autosaves in this browser and the app works offline once loaded. SHARE makes a link that opens this exact beat; EXPORT WAV renders a clean file. Keys: A–' synth (W E T Y U O P are the black keys), 1–8 drums, Space play/stop, Ctrl/Cmd+Z undo, Shift+Ctrl/Cmd+Z redo.";
