@@ -5,17 +5,19 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>NOCTURNE × 808 PIT — Browser Beat Lab</title>
   <meta name="description" content="NOCTURNE sequencing plus 808 PIT sound design: Atlanta 808 subs, Memphis chords, filter, envelope, waveform and a 12-track step sequencer. All sounds synthesized with Web Audio.">
-  <meta name="theme-color" content="#07050b">
+  <meta name="theme-color" content="#03020a">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="NOCTURNE">
   <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="icon" href="./favicon.ico" sizes="any">
   <link rel="icon" type="image/png" sizes="32x32" href="./icons/favicon-32.png">
-  <link rel="apple-touch-icon" href="./icons/apple-touch-icon.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="./icons/favicon-16.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="./icons/apple-touch-icon.png">
   <link rel="preload" href="./fonts/jetbrains-mono-latin.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="preload" href="./fonts/saira-xc-800-latin.woff2" as="font" type="font/woff2" crossorigin>
-  <link rel="stylesheet" href="./fonts/fonts.css">
+  <link rel="stylesheet" href="./fonts/fonts.css?v=2026.11.21-p5">
   <style>
     :root {
       /* Southern night 2077: candy paint over near-black. --cyan is the "live"
@@ -191,6 +193,8 @@
     .slots input, .slots select { background: #0b0b10; color: var(--fg); border: 1px solid var(--border); border-radius: 8px; padding: 6px 8px; font-size: 11px; min-width: 0; }
     #snack { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(16px + var(--safe-bottom)); z-index: 60; display: flex; gap: 10px; align-items: center; background: #1b1b22; border: 1px solid var(--border); border-radius: 12px; padding: 10px 14px; font-size: 12px; max-width: calc(100vw - 32px); }
     #snack[hidden] { display: none; }
+    #update-toast { position: fixed; left: 50%; transform: translateX(-50%); top: calc(10px + env(safe-area-inset-top, 0px)); z-index: 70; min-height: 44px; border-color: var(--cyan); color: var(--cyan); background: #120a1c; }
+    #update-toast[hidden] { display: none; }
     .step.beat { box-shadow: inset 0 0 0 1px #3a3a48; }
     .step.now { outline: 1px solid var(--orange); }
     .step { position: relative; }
@@ -217,6 +221,14 @@
     .smp .acts { display: flex; gap: 4px; flex-wrap: wrap; }
     .smp .acts .mini { padding: 4px 7px; }
     .smp .mini.rec.on { background: #e5484d; border-color: #e5484d; color: #fff; }
+    .smp .loop-acts { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: 4px; }
+    .smp .loop-acts .mini { min-height: 44px; padding: 4px 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .smp .mini.loop.on { background: var(--cyan); border-color: var(--cyan); color: #03020a; font-weight: 700; }
+    .smp .mini.loop.queued { border-color: var(--orange); color: var(--orange); }
+    .smp .mini[data-sact="choke"].on { border-color: var(--pit); color: var(--pit); }
+    .smp.looping { border-color: var(--cyan); box-shadow: 0 0 0 1px var(--cyan); }
+    #overdub.on { background: #e5484d; border-color: #e5484d; color: #fff; }
+    .build-tag { display: block; margin-top: 6px; opacity: .6; font-size: 10px; letter-spacing: .12em; }
     .sections { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; margin-top: 10px; }
     @media (min-width: 700px) { .sections { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
     .sec { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px; align-items: center; border: 1px solid var(--border); background: var(--card); border-radius: 12px; padding: 8px; min-width: 0; }
@@ -597,12 +609,13 @@
       <div class="row">
         <h2 class="grotesk">SAMPLES <span>RECORD OR IMPORT · 8 PADS · UP TO 10 s EACH</span></h2>
         <div class="controls">
+          <button class="btn" id="overdub" type="button" aria-pressed="false" aria-label="Overdub: record pad taps into the playing section from the next bar, without stopping anything">○ OVERDUB</button>
           <button class="btn" id="midi" type="button" aria-pressed="false">MIDI</button>
         </div>
       </div>
       <div class="smp-grid" id="smp-grid"></div>
       <input id="smp-file" type="file" accept="audio/*,.wav,.mp3,.m4a,.aac,.ogg,.flac,.aif,.aiff,.caf" hidden>
-      <p class="hint" id="smp-status" role="status" aria-live="polite">Tap REC to record from the mic (stops at 10 s) or LOAD to import an audio file (up to 10 MB). Samples are trimmed, normalised and kept in this browser. Use them as a track sound ("Your samples") in the sequencer. Share links point to your sample slots but don't include the audio.</p>
+      <p class="hint" id="smp-status" role="status" aria-live="polite">Tap REC to record from the mic (stops at 10 s) or LOAD to import an audio file (up to 10 MB). Samples are trimmed, normalised and kept in this browser. ⟳ LOOP keeps a sample looping as a layer (it starts on the next bar while the beat plays) and it keeps going while you tap pads, play sections or load patterns; only tapping ■ LOOP again or ■ STOP ALL stops it. Pad taps overlap each other unless you turn on CHOKE. ○ OVERDUB writes your pad taps into the playing section from the next bar. Use samples as a track sound ("Your samples") in the sequencer. Share links point to your sample slots but don't include the audio.</p>
       <p class="hint" id="midi-status" role="status" aria-live="polite"></p>
     </section>
 
@@ -799,8 +812,9 @@
       <p class="hint" id="ai-status" role="status" aria-live="polite">Loads as one undoable step. Your sound settings and metronome stay as they are.</p>
     </section>
   </main>
-  <footer>Made with NOCTURNE × 808 PIT · beats written by <a href="https://amienigma-llm.vercel.app/" target="_blank" rel="noopener">Amienigma AI</a></footer>
+  <footer>Made with NOCTURNE × 808 PIT · beats written by <a href="https://amienigma-llm.vercel.app/" target="_blank" rel="noopener">Amienigma AI</a><span class="build-tag" id="build-tag">build 2026.11.21-p5</span></footer>
   <div id="snack" role="status" aria-live="polite" hidden><span id="snack-msg"></span><button class="mini" id="snack-undo" type="button">UNDO</button></div>
-  <script type="module" src="./app.js"></script>
+  <button id="update-toast" class="btn" type="button" hidden>New version ready · tap to refresh</button>
+  <script type="module" src="./app.js?v=2026.11.21-p5"></script>
 </body>
 </html>
