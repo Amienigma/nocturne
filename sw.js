@@ -6,7 +6,7 @@
 // Network requests bypass the browser HTTP cache (cache: "no-cache" revalidates
 // with the server), because GitHub Pages sends max-age=600: without this a
 // "network-first" fetch could still hand back a 10-minute-old app.js.
-const VERSION = "v9-2026.11.21-p5";
+const VERSION = "v10-2026.11.21-p5b";
 const CACHE = `nocturne-shell-${VERSION}`;
 const SHELL = [
   "./", // not "./index.html": hosts with clean URLs (Vercel) redirect it
