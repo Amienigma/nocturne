@@ -17,6 +17,7 @@ import {
   GATES,
   RAMPS,
 } from "./music.mjs";
+import { SYNTH_IDS, SYNTH_WAVES, EDIT_KEYS, STRUMS, MAX_CHORD_NOTES, sanitizeSynthEdits } from "./synths.mjs";
 
 // v2 adds pattern banks A–D, song chain, per-track mixer and per-step
 // ratchet / probability / slide / length. v1 saves and links still load.
@@ -77,6 +78,7 @@ export function defaultState() {
     chain: [0],
     song: false,
     mixer: TRACKS.map(defaultMix),
+    synth: {},
   });
 }
 
@@ -85,6 +87,14 @@ const clampNum = (v, lo, hi, fallback) => (finite(v) ? Math.min(hi, Math.max(lo,
 
 function sanitizeCell(raw, base) {
   const c = isObj(raw) ? raw : {};
+  // Optional chord data (chord mode): explicit notes and a strum. Only present
+  // when used, so plain cells (and older saves) keep their exact shape.
+  const extra = {};
+  if (Array.isArray(c.notes)) {
+    const notes = [...new Set(c.notes.filter((n) => Number.isInteger(n) && n >= NOTE_MIN && n <= NOTE_MAX))].slice(0, MAX_CHORD_NOTES);
+    if (notes.length) extra.notes = notes;
+  }
+  if (extra.notes && Number.isInteger(c.strum) && c.strum > 0 && c.strum < STRUMS.length) extra.strum = c.strum;
   return {
     on: c.on === true,
     vel: finite(c.vel) ? roundVel(c.vel) : base.vel,
@@ -95,6 +105,7 @@ function sanitizeCell(raw, base) {
     slide: c.slide === true,
     gate: GATES.includes(c.gate) ? c.gate : 0,
     ramp: Number.isInteger(c.ramp) && c.ramp > 0 && c.ramp < RAMPS.length ? c.ramp : 0,
+    ...extra,
   };
 }
 
@@ -157,6 +168,7 @@ export function sanitizeState(raw) {
     chain: chain.length ? chain : [bank],
     song: raw.song === true,
     mixer: sanitizeMixer(raw.mixer),
+    synth: sanitizeSynthEdits(raw.synth),
   });
 }
 
@@ -176,6 +188,7 @@ export function serializeState(s) {
     chain: s.chain,
     song: s.song,
     mixer: s.mixer,
+    synth: s.synth,
   });
 }
 
@@ -197,7 +210,12 @@ export function bankIsEmpty(pattern) {
 //     ext (bits0-2 ratchet idx, bit3 slide, bits4-6 gate idx, bit7 ramp byte
 //     follows), prob(0-100) [, ramp idx 1..] - bit7 was always 0 before, so
 //     older v2 links decode unchanged and links without ramps are byte-identical.
+// Optional extension block (only written when used, so links without chords or
+// synth edits stay byte-identical): [0xE5]
+//   [u16 n] n x chord cell: bank, track, step, strum idx, note count, notes...
+//   [u8 m]  m x synth edit: preset idx, wave idx, 7 x 0-255 (EDIT_KEYS order)
 // v1 links ([1]... one pattern, 3 bytes per step) still decode.
+const EXT_TAG = 0xe5;
 export function packState(state) {
   const s = sanitizeState(state);
   if (!s) throw new Error("bad state");
@@ -227,7 +245,45 @@ export function packState(state) {
       }
     }
   });
+  const chords = [];
+  s.banks.forEach((pattern, b) => {
+    if (!(bankMask & (1 << b))) return;
+    pattern.forEach((row, t) => row.steps.forEach((c, j) => { if (c.on && c.notes) chords.push([b, t, j, c.strum || 0, c.notes.length, ...c.notes]); }));
+  });
+  const edits = Object.entries(s.synth || {});
+  if (chords.length || edits.length) {
+    out.push(EXT_TAG, chords.length >> 8, chords.length & 255);
+    for (const c of chords) out.push(...c);
+    out.push(edits.length);
+    for (const [id, e] of edits) {
+      out.push(SYNTH_IDS.indexOf(id), SYNTH_WAVES.indexOf(e.wave), ...EDIT_KEYS.map((k) => Math.round(e[k] * 255)));
+    }
+  }
   return Uint8Array.from(out);
+}
+
+function readExtension(r, raw) {
+  if (r.u8() !== EXT_TAG) throw new Error("ext tag");
+  const n = r.u16();
+  for (let i = 0; i < n; i++) {
+    const b = r.u8(), t = r.u8(), j = r.u8(), strum = r.u8(), count = r.u8();
+    if (count < 1 || count > MAX_CHORD_NOTES || strum >= STRUMS.length) throw new Error("chord");
+    const notes = Array.from({ length: count }, () => r.u8());
+    const cell = raw.banks?.[b]?.[t]?.steps?.[j];
+    if (!cell || !cell.on) throw new Error("chord cell");
+    cell.notes = notes;
+    if (strum) cell.strum = strum;
+  }
+  const m = r.u8();
+  raw.synth = {};
+  for (let i = 0; i < m; i++) {
+    const id = SYNTH_IDS[r.u8()];
+    const wave = SYNTH_WAVES[r.u8()];
+    if (!id || !wave) throw new Error("synth");
+    const e = { wave };
+    for (const k of EDIT_KEYS) e[k] = r.u8() / 255;
+    raw.synth[id] = e;
+  }
 }
 
 function reader(bytes) {
@@ -304,6 +360,7 @@ export function unpackState(bytes) {
     const bankMask = r.u8();
     if (bankMask > 15 || !(bankMask & (1 << raw.bank))) throw new Error("banks");
     raw.banks = Array.from({ length: BANKS }, (_, b) => (bankMask & (1 << b) ? readPattern(r, true) : null));
+    if (!r.done()) readExtension(r, raw);
   }
   if (!r.done()) throw new Error("trailing bytes");
   // Range checks (bpm, note, length...) are enforced by sanitizeState.

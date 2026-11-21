@@ -11,6 +11,7 @@ import {
   sourceIsTr808,
 } from "./music.mjs";
 import { pickRecordType, extensionForType } from "./state-io.mjs";
+import { resolveSynth, sourceIsSynth, STRUMS, chordNoteGain, MAX_CHORD_NOTES } from "./synths.mjs";
 import { makeBuffer } from "./samples.mjs";
 
 function distortionCurve(amount) {
@@ -71,15 +72,26 @@ export const POST_GAIN_LIMITER = 0.9; // after the musical LIMITER (it has auto 
 export const POST_GAIN_DIRECT = 1.28; // LIMITER off: the safety stage does the limiting
 export const SAFETY_HPF_HZ = 28;
 export const SAFETY_CEILING = 0.87; // ~-1.2 dBFS sample peak, leaves room for inter-sample peaks
-// The soft clip tops out a little lower (~-1.6 dBFS) than the hard ceiling, so
-// dense stacks are rounded off smoothly and the flat hard clamp (whose square
-// corners cause inter-sample overs) almost never engages: true peak <= -1.2 dBFS.
-export const SOFT_CEILING = 0.83;
+// The soft clip tops out lower (~-2.4 dBFS) than the hard ceiling, with a wide
+// knee (from 0.6 x ceiling), so dense stacks are rounded off smoothly. The
+// 4x-oversampler's ripple on clipped peaks then stays under the flat hard
+// clamp (whose square corners cause inter-sample overs): true peak <= -1.2 dBFS.
+export const SOFT_CEILING = 0.76;
+export const SOFT_KNEE = 0.6;
+// Brick-compressor tuning. Web Audio's DynamicsCompressor applies automatic
+// makeup gain (~0.6 x the gain reduction at 0 dBFS). With threshold -4 that was
+// +2.3 dB, which pushed dense layered chords/synths deep into the soft-clip
+// knee and caused true-peak overs. We now compress from -9 dB and trim the
+// extra makeup back off, so material below the threshold gets exactly the same
+// gain as before (+2.3 dB) while dense material lands ~-6 dB, below the knee.
+export const BRICK_THRESHOLD_DB = -9;
+export const BRICK_MAKEUP_TRIM = 0.72; // ≈ -2.85 dB
+
 export const SUB_FLOOR_HZ = 30;
 
 // Soft-clip curve: transparent below `knee`, smooth tanh shoulder above it,
 // and the endpoints (where any input beyond +/-1 lands) never exceed the ceiling.
-function ceilingCurve(ceiling = SOFT_CEILING, knee = 0.8 * SOFT_CEILING) {
+function ceilingCurve(ceiling = SOFT_CEILING, knee = SOFT_KNEE * SOFT_CEILING) {
   const n = 4097;
   const curve = new Float32Array(n);
   const room = ceiling - knee;
@@ -155,6 +167,7 @@ export class Studio {
     this.tape = null;
     this.masterGain = 0.85;
     this.patch = { ...DEFAULT_PATCH };
+    this.synthEdits = {}; // per synth preset: user edits (wave, filter, envelope, detune)
     this.voices = new Map();
     this.owners = new Map();
     this.born = new Map();
@@ -310,11 +323,13 @@ export class Studio {
     hp2.frequency.value = SAFETY_HPF_HZ;
     hp2.Q.value = 1.3066;
     const brick = ctx.createDynamicsCompressor();
-    brick.threshold.value = -4;
+    brick.threshold.value = BRICK_THRESHOLD_DB;
     brick.knee.value = 0;
     brick.ratio.value = 20;
     brick.attack.value = 0.001;
     brick.release.value = 0.08;
+    const makeupTrim = ctx.createGain();
+    makeupTrim.gain.value = BRICK_MAKEUP_TRIM;
     const ceiling = ctx.createWaveShaper();
     ceiling.curve = ceilingCurve();
     ceiling.oversample = "4x"; // tames aliasing / inter-sample peaks from the soft clip
@@ -323,7 +338,8 @@ export class Studio {
     dc.connect(hp1);
     hp1.connect(hp2);
     hp2.connect(brick);
-    brick.connect(ceiling);
+    brick.connect(makeupTrim);
+    makeupTrim.connect(ceiling);
     this.safetyIn = this.post;
     this.safetyLimiter = brick;
     this.out = ceiling;
@@ -1595,6 +1611,20 @@ export class Studio {
     const t = when;
     const vel = velocity;
     const gate = this.gateSec;
+    if (sourceIsSynth(source)) {
+      const notes = Array.isArray(step?.notes) && step.notes.length ? step.notes : [step?.note ?? 60];
+      this.playSynth(source.slice(4), notes, t, vel, gate, STRUMS[step?.strum] || 0);
+      return;
+    }
+    if (sourceIsPit(source) && Array.isArray(step?.notes) && step.notes.length > 1) {
+      // A chord written onto a PIT track: every note through the PIT voice.
+      const wave = pitWaveFromSource(source);
+      const musical = toMusical(this.patch);
+      const dur = gate > 0 ? gate : Math.max(0.16, musical.attack + musical.decay + musical.release * 0.65 + 0.18);
+      const g = chordNoteGain(step.notes.length);
+      for (const n of step.notes.slice(0, MAX_CHORD_NOTES)) this.firePit(n, t, vel * g, wave, dur);
+      return;
+    }
     if (sourceIsPit(source)) {
       const wave = pitWaveFromSource(source);
       const midi = step?.note ?? 36;
@@ -1629,6 +1659,167 @@ export class Studio {
       return;
     }
     this.playNamed(source, t, vel);
+  }
+
+  setSynthEdits(edits) {
+    this.synthEdits = edits && typeof edits === "object" ? edits : {};
+  }
+
+  // ---- Synth presets (syn:<id>) ---------------------------------------------
+  // One voice per chord, so dense chords stay cheap: every note's 1-3
+  // oscillators feed one shared gain per oscillator row -> one filter (or two
+  // formant band-passes) -> one envelope -> the track strip. Vibrato and breath
+  // noise are shared too. A strummed chord gives each later note its own tiny
+  // fade-in (no click). Notes play at 1/sqrt(n) so chords keep their level.
+  // Everything stops and disconnects after the release.
+  playSynth(id, notes, when, velocity = 0.8, gate = 0, strumMs = 0) {
+    if (!this.arm()) return;
+    const P = resolveSynth(id, this.synthEdits[id]);
+    if (!P) return;
+    const C = this.ctx;
+    const list = [...new Set(notes.filter(Number.isFinite))].slice(0, MAX_CHORD_NOTES).sort((a, b) => a - b);
+    if (!list.length) return;
+    const lowHz = foldSub(Math.max(20, midiToHz(list[0])));
+    if (strumMs < 0) list.reverse();
+    const step = Math.abs(strumMs) / 1000;
+    const out = this.route ? this.route.in : this.buses["808"] || this.master;
+    const per = chordNoteGain(list.length) * Math.min(1, Math.max(0.05, velocity)) * P.level;
+    const oscSum = P.osc.reduce((a, o) => a + o.gain, 0) || 1;
+    const nyq = C.sampleRate / 2 - 200;
+    const { a, d, s: sus, r } = P.amp;
+    const t = when;
+    const spread = step * (list.length - 1);
+    const hold = gate > 0 ? Math.max(0.03, gate) : sus > 0.05 ? Math.max(0.18, a + 0.12 + spread) : a + d + spread;
+    const end = t + hold;
+    const stopAt = end + r + 0.05;
+    const nodes = [];
+    let head = null;
+    const track = (src) => { src.start(src.__t ?? t); src.stop(stopAt); head = src; };
+    // Filter (tracks the chord's lowest note when the preset asks for it).
+    const filt = C.createBiquadFilter();
+    filt.type = P.filter.type;
+    const fBase = Math.min(nyq, P.filter.track ? P.filter.hz * Math.sqrt(lowHz / 220) : P.filter.hz);
+    filt.Q.value = P.filter.q;
+    if (P.filter.env && P.filter.env !== 1) {
+      const peakHz = Math.min(nyq, Math.max(40, fBase * P.filter.env));
+      const fa = P.filter.attack || 0.002;
+      filt.frequency.setValueAtTime(P.filter.env > 1 ? fBase : peakHz, t);
+      filt.frequency.linearRampToValueAtTime(P.filter.env > 1 ? peakHz : fBase, t + fa);
+      if (P.filter.env > 1) filt.frequency.setTargetAtTime(fBase, t + fa, Math.max(0.01, P.filter.envDec / 3));
+    } else {
+      filt.frequency.value = fBase;
+    }
+    nodes.push(filt);
+    // Where the oscillator rows land: the filter, or the formant band-passes.
+    const into = [];
+    if (P.formant) {
+      for (const [i, fhz] of P.formant.entries()) {
+        const bp = C.createBiquadFilter();
+        bp.type = "bandpass";
+        bp.frequency.value = Math.min(nyq, fhz);
+        bp.Q.value = 5;
+        const g = C.createGain();
+        g.gain.value = i === 0 ? 2.2 : 1.6;
+        bp.connect(g);
+        g.connect(filt);
+        into.push(bp);
+        nodes.push(bp, g);
+      }
+    } else {
+      into.push(filt);
+    }
+    const rows = P.osc.map((o) => {
+      const g = C.createGain();
+      g.gain.value = o.gain / oscSum;
+      for (const dst of into) g.connect(dst);
+      nodes.push(g);
+      return g;
+    });
+    let vibDepth = null;
+    if (P.vib) {
+      const lfo = C.createOscillator();
+      lfo.frequency.value = P.vib.rate;
+      vibDepth = C.createGain();
+      vibDepth.gain.setValueAtTime(0, t);
+      vibDepth.gain.linearRampToValueAtTime(P.vib.cents, t + P.vib.delay + 0.2);
+      lfo.connect(vibDepth);
+      nodes.push(vibDepth);
+      track(lfo);
+    }
+    if (P.noise && this.white) {
+      const n = C.createBufferSource();
+      n.buffer = this.white;
+      n.loop = true;
+      const bp = C.createBiquadFilter();
+      bp.type = "bandpass";
+      bp.frequency.value = Math.min(nyq, P.noise.hz);
+      bp.Q.value = P.noise.q;
+      const ng = C.createGain();
+      ng.gain.value = P.noise.gain * Math.sqrt(list.length);
+      n.connect(bp);
+      bp.connect(ng);
+      for (const dst of into) ng.connect(dst);
+      nodes.push(bp, ng);
+      track(n);
+    }
+    list.forEach((midi, k) => {
+      const tk = t + k * step;
+      const hz = foldSub(Math.max(20, midiToHz(midi)));
+      // Strummed notes after the first fade in over a few ms (no click).
+      const strummed = k > 0 && step > 0;
+      P.osc.forEach((o, i) => {
+        const f = hz * o.ratio;
+        if (f >= nyq) return;
+        const osc = C.createOscillator();
+        osc.type = o.type;
+        osc.frequency.value = f;
+        if (o.detune) osc.detune.value = o.detune;
+        if (vibDepth) vibDepth.connect(osc.detune);
+        if (strummed) {
+          const fade = C.createGain();
+          fade.gain.setValueAtTime(0, tk);
+          fade.gain.linearRampToValueAtTime(1, tk + Math.max(0.004, Math.min(a, 0.03)));
+          osc.connect(fade);
+          fade.connect(rows[i]);
+          nodes.push(fade);
+        } else {
+          osc.connect(rows[i]);
+        }
+        osc.__t = tk;
+        track(osc);
+      });
+    });
+    const env = C.createGain();
+    filt.connect(env);
+    env.connect(out);
+    nodes.push(env);
+    // One envelope: attack, decay to sustain, then release from wherever the
+    // decay has got to at note-off (computed, so no second VCA is needed).
+    const ta = t + Math.max(0.001, a);
+    const tau = Math.max(0.005, d / 3);
+    env.gain.setValueAtTime(0, t);
+    if (end <= ta) {
+      const lvl = per * Math.max(0, (end - t) / Math.max(0.001, a));
+      env.gain.linearRampToValueAtTime(lvl, end);
+    } else {
+      env.gain.linearRampToValueAtTime(per, ta);
+      env.gain.setTargetAtTime(per * sus, ta, tau);
+      const lvl = per * sus + (per - per * sus) * Math.exp(-(end - ta) / tau);
+      env.gain.setValueAtTime(lvl, end);
+    }
+    env.gain.linearRampToValueAtTime(0, end + r);
+    if (head) {
+      head.addEventListener("ended", () => {
+        for (const node of nodes) try { node.disconnect(); } catch { /* gone */ }
+      });
+    }
+    this.lastHz = midiToHz(list[0]);
+  }
+
+  /** Audition a synth preset (keys, chord previews): straight to the category bus. */
+  previewSynth(id, notes, velocity = 0.75, gate = 0.5, strumMs = 0) {
+    if (!this.arm()) return;
+    this.playSynth(id, notes, this.ctx.currentTime + 0.01, velocity, gate, strumMs);
   }
 
   // ---- Classic TR-808 voices ----------------------------------------------
