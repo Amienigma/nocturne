@@ -64,6 +64,9 @@ import { SAMPLE_SLOTS, MAX_FILE_BYTES, MAX_SAMPLE_SEC, prepareSample, loadSample
 import { midiSupported, connectMidi, drumTrackForNote } from "./src/midi.mjs";
 import { renderWav, EXPORT_BARS } from "./src/export.mjs";
 import { AI_ENDPOINT, buildBeatPrompt, extractJson, beatFromAi, RateLimiter } from "./src/beat-ai.mjs";
+import { CITIES, PATTERNS, patternsIn, patternById, buildPattern, loadPatternInto } from "./src/patterns.mjs";
+import { SYNTH_PRESETS, SYNTH_WAVES, synthById, resolveSynth, sanitizeEdit, defaultEdit, STRUM_LABELS, STRUMS } from "./src/synths.mjs";
+import { KEY_NAMES, SCALES, PROGRESSIONS, CHORD_TYPES, VOICINGS, INVERSIONS, RHYTHMS, progressionById, sanitizeChordSettings, progressionNames, chordNotes, chordSymbol, writeChords, romanFor } from "./src/chords.mjs";
 
 const studio = getStudio();
 const state = withPatternAlias({
@@ -100,6 +103,7 @@ const state = withPatternAlias({
   active: [],
   metronome: defaultMetronome(),
   tape: false,
+  synth: {}, // per synth preset edits (saved with the beat)
 });
 // Tape-deck layer transports (one per track); see the "Tape deck" section.
 let layers = sanitizeLayers(null, TRACKS.length);
@@ -147,6 +151,8 @@ function applyState(raw, { keepMetronome = false, keepPatch = false } = {}) {
   state.chain = s.chain;
   state.song = s.song;
   state.mixer = s.mixer;
+  state.synth = s.synth || {};
+  studio.setSynthEdits(state.synth);
   looperQueue.clear();
   for (const l of loopers) l.on = false;
   queuedMode = null;
@@ -163,6 +169,8 @@ function applyState(raw, { keepMetronome = false, keepPatch = false } = {}) {
   renderSeq();
   renderPaint();
   renderLcd();
+  renderLibrary();
+  renderSynthEdit();
   return true;
 }
 
@@ -578,6 +586,7 @@ function arm() {
   studio.setLimiter(state.limiter);
   studio.setMasterGain(Number($("vol").value));
   studio.setMetronomeVolume(state.metronome.vol);
+  studio.setSynthEdits(state.synth);
   state.armed = true;
   document.body.classList.remove("waiting");
   renderLcd();
@@ -935,6 +944,7 @@ function sourceLabel(id) {
 function cellText(row, cell) {
   if (!cell.on || !sourceIsMelodic(row.source)) return "";
   if (sourceIsChord(row.source)) return HITS.find((h) => h.id === cell.chordId)?.symbol || "•";
+  if (cell.notes && cell.notes.length > 1) return chordSymbol(cell.notes);
   return `${cell.slide ? "↗" : ""}${noteName(cell.note)}`;
 }
 
@@ -1436,7 +1446,7 @@ function renderInspector() {
   const row = state.pattern[t];
   const cell = row?.steps[s];
   if (!cell) return;
-  const melodic = sourceIsMelodic(row.source) && !sourceIsChord(row.source) && !row.source.startsWith("tr:");
+  const melodic = sourceIsMelodic(row.source) && !sourceIsChord(row.source) && !row.source.startsWith("tr:") && !row.source.startsWith("syn:");
   $("insp-title").textContent = `${TRACKS[t].toUpperCase()} · STEP ${s + 1}${cell.on ? "" : " (off)"}`;
   $("insp").classList.toggle("off", !cell.on);
   $("insp-vel").value = String(cell.vel);
@@ -1650,7 +1660,8 @@ function sectionLabel(b) {
   if (label == null) {
     classicSigs ??= classicBanks().map((x) => JSON.stringify(x));
     const empty = p.every((row) => row.steps.every((c) => !c.on));
-    label = empty ? "empty" : JSON.stringify(p) === classicSigs[b] ? CLASSIC_SECTIONS[b].name : "edited";
+    const sig = JSON.stringify(p);
+    label = empty ? "empty" : sig === classicSigs[b] ? CLASSIC_SECTIONS[b].name : libraryNameFor(sig) || "edited";
     sectionLabels.set(p, label);
   }
   return label;
@@ -1686,6 +1697,7 @@ function renderBanks() {
     if (len) len.value = String(q?.len ?? l.len);
   });
   renderLooperLive();
+  renderLibraryTarget();
   const songBtn = $("song");
   songBtn.classList.toggle("on", state.song);
   songBtn.classList.toggle("queued", queuedMode === "song");
@@ -2736,6 +2748,371 @@ function bind() {
   });
 }
 
+// ---- Pattern library (32 tap-to-load grooves) ------------------------------
+// A tap replaces the section you're editing (one undo step) and sets tempo and
+// swing. Section loopers keep running; a playing section picks it up on its
+// next step. Cards are static buttons (no animation).
+const PREFS_KEY = "nocturne.synthchords.v1";
+const prefs = (() => {
+  const raw = safeParse(store()?.getItem(PREFS_KEY) || "null") || {};
+  return {
+    city: CITIES.some((c) => c.id === raw.city) ? raw.city : "ATL",
+    synth: synthById(raw.synth) ? raw.synth : "keys",
+    chords: sanitizeChordSettings(raw.chords),
+  };
+})();
+function savePrefs() {
+  try { store()?.setItem(PREFS_KEY, JSON.stringify(prefs)); } catch { /* storage blocked */ }
+}
+
+// Library names for the section cards: a cheap hash of each built pattern.
+const hash = (str) => { let h = 2166136261; for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; };
+let libraryHashes = null;
+function libraryNameFor(sig) {
+  libraryHashes ??= new Map(PATTERNS.map((p) => [hash(JSON.stringify(buildPattern(p.id))), p.name]));
+  return libraryHashes.get(hash(sig)) || null;
+}
+
+function renderLibraryTarget() {
+  const N = BANK_NAMES[state.bank];
+  document.querySelectorAll("[data-libbank]").forEach((el) => {
+    const on = Number(el.dataset.libbank) === state.bank;
+    el.classList.toggle("on", on);
+    el.setAttribute("aria-pressed", String(on));
+  });
+  const w = $("chord-write");
+  if (w) w.textContent = `WRITE TO SECTION ${N}`;
+  const name = sectionLabel(state.bank);
+  document.querySelectorAll(".lib-card").forEach((el) => {
+    const on = patternById(el.dataset.lib)?.name === name;
+    el.classList.toggle("on", on);
+    el.setAttribute("aria-label", `${el.dataset.title}: load into section ${N}${on ? " (loaded)" : ""}`);
+  });
+}
+
+function renderLibrary() {
+  const tabs = $("lib-tabs");
+  if (!tabs) return;
+  if (!tabs.childElementCount) {
+    for (const c of CITIES) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "lib-tab";
+      b.role = "tab";
+      b.dataset.city = c.id;
+      b.textContent = c.label;
+      tabs.appendChild(b);
+    }
+  }
+  tabs.querySelectorAll("[data-city]").forEach((el) => el.setAttribute("aria-selected", String(el.dataset.city === prefs.city)));
+  const city = CITIES.find((c) => c.id === prefs.city);
+  $("lib-detail").textContent = `${city.detail} · ${patternsIn(city.id).length} grooves`;
+  const grid = $("lib-grid");
+  if (grid.dataset.city !== prefs.city) {
+    grid.dataset.city = prefs.city;
+    grid.innerHTML = "";
+    for (const p of patternsIn(prefs.city)) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "lib-card";
+      b.dataset.lib = p.id;
+      b.dataset.title = `${p.name}, ${p.bpm} BPM`;
+      b.title = p.blurb;
+      b.innerHTML = `<b></b><small><span class="tempo"></span> · <span class="feel"></span></small>`;
+      b.querySelector("b").textContent = p.name;
+      b.querySelector(".tempo").textContent = `${p.bpm} BPM`;
+      b.querySelector(".feel").textContent = p.swing ? `swing ${p.swing}` : "straight";
+      grid.appendChild(b);
+    }
+  }
+  renderLibraryTarget();
+}
+
+function loadLibraryPattern(id) {
+  const spec = patternById(id);
+  if (!spec) return;
+  const N = BANK_NAMES[state.bank];
+  commit(() => { loadPatternInto(state, id); }, `${spec.name} loaded into section ${N} (${spec.bpm} BPM)`);
+  studio.setSendTempo(state.bpm);
+  syncControls();
+  renderSeq();
+  renderInspector();
+  renderBanks();
+  saveNow();
+}
+
+function initLibrary() {
+  $("lib-tabs").addEventListener("click", (e) => {
+    const t = e.target.closest?.("[data-city]");
+    if (!t) return;
+    prefs.city = t.dataset.city;
+    savePrefs();
+    renderLibrary();
+  });
+  $("lib-tabs").addEventListener("keydown", (e) => {
+    if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
+    const i = CITIES.findIndex((c) => c.id === prefs.city);
+    prefs.city = CITIES[(i + (e.key === "ArrowRight" ? 1 : CITIES.length - 1)) % CITIES.length].id;
+    savePrefs();
+    renderLibrary();
+    $("lib-tabs").querySelector(`[data-city="${prefs.city}"]`)?.focus();
+  });
+  $("lib-grid").addEventListener("click", (e) => {
+    const c = e.target.closest?.("[data-lib]");
+    if (c) loadLibraryPattern(c.dataset.lib);
+  });
+  document.querySelectorAll("[data-libbank]").forEach((el) => {
+    el.addEventListener("click", () => pickBank(Number(el.dataset.libbank)));
+  });
+  renderLibrary();
+}
+
+// ---- Synths & chords ---------------------------------------------------------
+const SYN_TRACK = TRACKS.indexOf("Synth");
+const SUB_TRACK = TRACKS.indexOf("808");
+
+function currentEdit(id = prefs.synth) {
+  return sanitizeEdit(id, state.synth[id] || defaultEdit(id));
+}
+
+function renderSynthGrid() {
+  const grid = $("syn-grid");
+  if (!grid.childElementCount) {
+    for (const p of SYNTH_PRESETS) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "chip";
+      b.dataset.syn = p.id;
+      b.title = p.detail;
+      b.innerHTML = "<span></span><small></small>";
+      b.firstChild.textContent = p.label;
+      b.lastChild.textContent = p.group === "NEW" ? "NEW WAVE" : p.group;
+      grid.appendChild(b);
+    }
+  }
+  grid.querySelectorAll("[data-syn]").forEach((el) => {
+    const on = el.dataset.syn === prefs.synth;
+    el.classList.toggle("on", on);
+    el.setAttribute("aria-pressed", String(on));
+  });
+  const p = synthById(prefs.synth);
+  $("syn-name").textContent = `${p.label.toUpperCase()} · TAP TO HEAR`;
+  $("syn-detail").textContent = p.detail;
+}
+
+const fmtSec = (x) => (x < 1 ? `${Math.round(x * 1000)} ms` : `${x.toFixed(2)} s`);
+function renderSynthEdit() {
+  const root = $("syn-edit");
+  if (!root) return;
+  const id = prefs.synth;
+  const e = currentEdit(id);
+  const r = resolveSynth(id, e);
+  const shown = {
+    cutoff: formatHz(r.filter.hz),
+    resonance: `Q ${r.filter.q.toFixed(1)}`,
+    attack: fmtSec(r.amp.a),
+    decay: fmtSec(r.amp.d),
+    sustain: `${Math.round(r.amp.s * 100)}%`,
+    release: fmtSec(r.amp.r),
+    detune: `×${(e.detune * 2 <= 1 ? e.detune * 2 : 1 + (e.detune * 2 - 1) * 2).toFixed(1)}`,
+  };
+  if (!root.childElementCount) {
+    const wave = document.createElement("label");
+    wave.innerHTML = "WAVE <select id=\"syn-wave\"></select>";
+    for (const w of SYNTH_WAVES) {
+      const o = document.createElement("option");
+      o.value = w;
+      o.textContent = w === "preset" ? "preset's own" : w;
+      wave.querySelector("select").appendChild(o);
+    }
+    root.appendChild(wave);
+    for (const [k, label] of [["cutoff", "FILTER"], ["resonance", "RESO"], ["attack", "ATTACK"], ["decay", "DECAY"], ["sustain", "SUSTAIN"], ["release", "RELEASE"], ["detune", "DETUNE"]]) {
+      const l = document.createElement("label");
+      l.innerHTML = `<span>${label} <span class="val" data-synval="${k}"></span></span><input type="range" min="0" max="1" step="0.01" data-synedit="${k}" aria-label="${label.toLowerCase()}">`;
+      root.appendChild(l);
+    }
+    const reset = document.createElement("button");
+    reset.type = "button";
+    reset.className = "mini";
+    reset.id = "syn-reset";
+    reset.textContent = "RESET SYNTH";
+    root.appendChild(reset);
+  }
+  $("syn-wave").value = e.wave;
+  root.querySelectorAll("[data-synedit]").forEach((el) => { el.value = String(e[el.dataset.synedit]); });
+  root.querySelectorAll("[data-synval]").forEach((el) => { el.textContent = shown[el.dataset.synval]; });
+}
+
+function setSynthEdit(patch) {
+  const id = prefs.synth;
+  state.synth = { ...state.synth, [id]: { ...currentEdit(id), ...patch } };
+  studio.setSynthEdits(state.synth);
+  renderSynthEdit();
+}
+
+function firstChordNotes() {
+  const c = prefs.chords;
+  const deg = progressionById(c.prog).degrees[0];
+  return chordNotes({ key: c.key, scale: c.scale, degree: deg, type: c.type, voicing: c.voicing, inversion: c.inversion, octave: c.octave });
+}
+
+function hearSynth() {
+  if (!arm()) return;
+  studio.previewSynth(prefs.synth, firstChordNotes(), 0.75, 0.6, STRUMS[prefs.chords.strum]);
+}
+
+function fillSelect(id, items) {
+  const el = $(id);
+  if (el.childElementCount) return el;
+  for (const [value, label] of items) {
+    const o = document.createElement("option");
+    o.value = String(value);
+    o.textContent = label;
+    el.appendChild(o);
+  }
+  return el;
+}
+
+function renderChords() {
+  const c = prefs.chords;
+  fillSelect("ch-key", KEY_NAMES.map((n, i) => [i, n])).value = String(c.key);
+  fillSelect("ch-scale", SCALES.map((x) => [x.id, x.label])).value = c.scale;
+  fillSelect("ch-type", CHORD_TYPES.map((x) => [x.id, x.label])).value = c.type;
+  fillSelect("ch-voicing", VOICINGS.map((x) => [x.id, x.label])).value = c.voicing;
+  fillSelect("ch-inv", INVERSIONS.map((x, i) => [i, x])).value = String(c.inversion);
+  fillSelect("ch-rhythm", RHYTHMS.map((x) => [x.id, x.label])).value = c.rhythm;
+  fillSelect("ch-strum", STRUM_LABELS.map((x, i) => [i, x])).value = String(c.strum);
+  $("ch-span").value = String(c.span);
+  $("ch-oct").value = String(c.octave);
+  $("ch-follow").checked = c.follow;
+  const grid = $("prog-grid");
+  if (!grid.childElementCount) {
+    for (const p of PROGRESSIONS) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "chip";
+      b.dataset.prog = p.id;
+      b.title = p.detail;
+      b.textContent = p.label;
+      grid.appendChild(b);
+    }
+  }
+  grid.querySelectorAll("[data-prog]").forEach((el) => {
+    const on = el.dataset.prog === c.prog;
+    el.classList.toggle("on", on);
+    el.setAttribute("aria-pressed", String(on));
+  });
+  const prog = progressionById(c.prog);
+  const read = $("chord-read");
+  read.textContent = progressionNames(c).join(" · ");
+  const sub = document.createElement("small");
+  const scale = SCALES.find((x) => x.id === c.scale);
+  sub.textContent = `${KEY_NAMES[c.key]} ${scale.label.toLowerCase()} · ${prog.degrees.map((d) => romanFor(c.scale, d)).join(" – ")} · ${c.span === 16 ? "1 bar" : "½ bar"} each`;
+  read.appendChild(sub);
+}
+
+function hearChords() {
+  if (!arm()) return;
+  const c = prefs.chords;
+  const spanSec = (60 / state.bpm / 4) * c.span;
+  const t0 = studio.ctx.currentTime + 0.05;
+  progressionById(c.prog).degrees.forEach((degree, i) => {
+    const notes = chordNotes({ key: c.key, scale: c.scale, degree, type: c.type, voicing: c.voicing, inversion: c.inversion, octave: c.octave });
+    studio.playSynth(prefs.synth, notes, t0 + i * spanSec, 0.72, spanSec * 0.9, STRUMS[c.strum]);
+  });
+}
+
+function writeChordsNow() {
+  const N = BANK_NAMES[state.bank];
+  const names = progressionNames(prefs.chords).join(" · ");
+  commit(() => {
+    state.pattern = writeChords(state.pattern, prefs.chords, { synthTrack: SYN_TRACK, subTrack: SUB_TRACK, synthSource: `syn:${prefs.synth}`, length: state.length });
+  }, `Chords written to section ${N}: ${names}`);
+  state.selectedTrack = SYN_TRACK;
+  renderSeq();
+  renderInspector();
+  renderBanks();
+  saveNow();
+}
+
+function initSynthChords() {
+  $("syn-grid").addEventListener("click", (e) => {
+    const b = e.target.closest?.("[data-syn]");
+    if (!b) return;
+    prefs.synth = b.dataset.syn;
+    savePrefs();
+    renderSynthGrid();
+    renderSynthEdit();
+    hearSynth();
+    // The Synth track of the section you're editing switches to this preset.
+    const src = `syn:${prefs.synth}`;
+    if (state.pattern[SYN_TRACK].source !== src) {
+      commit(() => { state.pattern = setTrackSource(state.pattern, SYN_TRACK, src); }, `Section ${BANK_NAMES[state.bank]} Synth track: ${synthById(prefs.synth).label}`);
+      renderTrackBar();
+      renderSeq();
+    }
+  });
+  const edit = $("syn-edit");
+  edit.addEventListener("input", (e) => {
+    const k = e.target.dataset?.synedit;
+    if (!k) return;
+    beginEdit();
+    setSynthEdit({ [k]: Number(e.target.value) });
+  });
+  edit.addEventListener("change", (e) => {
+    if (e.target.id === "syn-wave") {
+      commit(() => setSynthEdit({ wave: e.target.value }));
+      hearSynth();
+      return;
+    }
+    if (e.target.dataset?.synedit) {
+      endEdit();
+      hearSynth();
+    }
+  });
+  edit.addEventListener("click", (e) => {
+    if (e.target.id !== "syn-reset") return;
+    commit(() => {
+      const next = { ...state.synth };
+      delete next[prefs.synth];
+      state.synth = next;
+      studio.setSynthEdits(state.synth);
+    }, `${synthById(prefs.synth).label} reset`);
+    renderSynthEdit();
+  });
+  const bind = (id, key, conv = (v) => v) => {
+    $(id).addEventListener("change", (e) => {
+      prefs.chords = sanitizeChordSettings({ ...prefs.chords, [key]: conv(e.target.type === "checkbox" ? e.target.checked : e.target.value) });
+      savePrefs();
+      renderChords();
+    });
+  };
+  bind("ch-key", "key", Number);
+  bind("ch-scale", "scale");
+  bind("ch-type", "type");
+  bind("ch-voicing", "voicing");
+  bind("ch-inv", "inversion", Number);
+  bind("ch-rhythm", "rhythm");
+  bind("ch-strum", "strum", Number);
+  bind("ch-span", "span", Number);
+  bind("ch-oct", "octave", Number);
+  bind("ch-follow", "follow");
+  $("prog-grid").addEventListener("click", (e) => {
+    const b = e.target.closest?.("[data-prog]");
+    if (!b) return;
+    const p = progressionById(b.dataset.prog);
+    prefs.chords = sanitizeChordSettings({ ...prefs.chords, prog: p.id, scale: p.scale });
+    savePrefs();
+    renderChords();
+    hearChords();
+  });
+  $("chord-hear").addEventListener("click", hearChords);
+  $("chord-write").addEventListener("click", writeChordsNow);
+  renderSynthGrid();
+  renderSynthEdit();
+  renderChords();
+}
+
 renderWaves();
 renderKnobs();
 renderBank();
@@ -2749,6 +3126,8 @@ initBanks();
 initInspector();
 initMixer();
 initDeck();
+initLibrary();
+initSynthChords();
 void initSamples();
 initMidi();
 renderPaint();

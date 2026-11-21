@@ -62,6 +62,7 @@ export async function renderWav(state, { bars = 4, bitDepth = 16, masterGain = 0
   s.limiterOn = !!state.limiter;
   s.tapeOn = !!tape;
   s.patch = { ...s.patch, ...state.patch };
+  s.setSynthEdits(state.synth || {});
   s.build();
   s.applyPatch();
   s.setMixer(state.mixer);

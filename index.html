@@ -452,6 +452,58 @@
       .brand h1.wordmark { font-size: 34px; }
     }
     .armed-banner { background: linear-gradient(90deg, rgba(155, 77, 255, .18), rgba(255, 59, 107, .12)); border-color: #4a3d63; color: #e7dcf5; }
+    /* Pattern library: city tabs + illuminated groove cards (static, no animation). */
+    .lib-target { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 4px 0 10px; }
+    .lib-target .libbank { font-family: var(--display); font-weight: 800; font-size: 22px; min-width: 48px; padding: 0 8px; }
+    .lib-tabs { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+    .lib-tab {
+      min-height: 48px; border-radius: 10px; border: 1px solid transparent; cursor: pointer;
+      font-family: var(--display); font-weight: 800; font-size: 20px; letter-spacing: .12em; color: #ece9f5;
+      background: linear-gradient(180deg, #221931, #140d1e) padding-box, var(--chrome-rim) border-box;
+    }
+    .lib-tab[aria-selected="true"] { background: var(--candy) padding-box, linear-gradient(180deg, #ffffff, #8c63c9) border-box; color: #14081f; }
+    .lib-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; margin-top: 8px; }
+    .lib-card {
+      min-height: 64px; text-align: left; padding: 8px 12px; border-radius: 12px; cursor: pointer;
+      border: 1px solid #3a2c52; color: var(--fg);
+      background: radial-gradient(120% 90% at 0% 0%, rgba(155, 77, 255, .14), transparent 60%), linear-gradient(180deg, #1b1228, #0f0a17);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .07), inset 0 -2px 0 rgba(0, 0, 0, .5);
+      display: flex; flex-direction: column; gap: 3px;
+    }
+    .lib-card b { font-family: var(--display); font-weight: 800; font-size: 19px; letter-spacing: .06em; line-height: 1.1; }
+    .lib-card small { color: var(--muted); font-size: 11px; letter-spacing: .06em; }
+    .lib-card .tempo { color: var(--orange); }
+    .lib-card.on { border-color: var(--orange); box-shadow: 0 0 0 1px var(--orange), inset 0 1px 0 rgba(255, 255, 255, .1); }
+    /* Synths & chords. */
+    .sub-h { font-family: var(--display); font-weight: 800; font-size: 18px; letter-spacing: .12em; margin: 14px 0 6px; display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+    .sub-h .hint { font-family: inherit; font-weight: 600; font-size: 12px; }
+    .syn-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 6px; }
+    .syn-grid .chip { text-align: left; display: flex; flex-direction: column; justify-content: center; gap: 1px; line-height: 1.15; }
+    .syn-grid .chip small { color: var(--muted); font-size: 10px; letter-spacing: .1em; }
+    .syn-grid .chip.on small { color: #1d1404; }
+    .syn-edit { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px 12px; margin-top: 8px; align-items: end; }
+    .syn-edit label, .chord-form label { display: flex; flex-direction: column; gap: 4px; font-size: 11px; letter-spacing: .1em; color: var(--muted); }
+    .syn-edit .val { color: var(--fg); }
+    .syn-edit input[type=range] { min-height: 32px; }
+    .syn-edit select, .chord-form select { min-height: 44px; background: #0e0916; color: var(--fg); border: 1px solid #3a2c52; border-radius: 8px; padding: 0 8px; font: inherit; font-size: 13px; }
+    .chord-form { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px 12px; }
+    .chord-form label.check { flex-direction: row; align-items: center; min-height: 44px; color: var(--fg); gap: 10px; }
+    .chord-form input[type=checkbox] { width: 24px; height: 24px; accent-color: var(--orange); }
+    .prog-grid { display: flex; flex-wrap: wrap; gap: 6px; }
+    .chord-read {
+      font-family: var(--display); font-weight: 800; font-size: 26px; letter-spacing: .08em; margin: 10px 0 6px;
+      color: #f3eefa; background: linear-gradient(180deg, #120a1d, #0a0612); border: 1px solid #3a2b52; border-radius: 10px; padding: 8px 12px;
+      box-shadow: inset 0 0 30px rgba(155, 77, 255, .14);
+    }
+    .chord-read small { display: block; font-family: inherit; font-weight: 600; font-size: 12px; letter-spacing: .14em; color: var(--muted); }
+    .chord-go { display: flex; gap: 8px; flex-wrap: wrap; }
+    @media (max-width: 600px) {
+      .lib-grid { grid-template-columns: 1fr 1fr; }
+      .lib-card b { font-size: 17px; }
+      .lib-tab { font-size: 17px; letter-spacing: .06em; }
+      .syn-grid { grid-template-columns: 1fr 1fr; }
+      .chord-form, .syn-edit { grid-template-columns: 1fr 1fr; }
+    }
   </style>
 </head>
 <body class="waiting">
@@ -562,6 +614,23 @@
       <div class="bank-grid" id="bank-pads"></div>
     </section>
 
+    <section class="panel" id="library" aria-labelledby="lib-h">
+      <div class="row">
+        <h2 class="grotesk" id="lib-h">PATTERN LIBRARY <span>32 TRAP GROOVES · ATL · MEM · HTX · NEW WAVE</span></h2>
+      </div>
+      <div class="lib-target" role="group" aria-label="Section the library loads into">
+        <span class="hint">LOADS INTO</span>
+        <button class="mini libbank" data-libbank="0" type="button" aria-label="Load into section A">A</button>
+        <button class="mini libbank" data-libbank="1" type="button" aria-label="Load into section B">B</button>
+        <button class="mini libbank" data-libbank="2" type="button" aria-label="Load into section C">C</button>
+        <button class="mini libbank" data-libbank="3" type="button" aria-label="Load into section D">D</button>
+      </div>
+      <div class="lib-tabs" id="lib-tabs" role="tablist" aria-label="City"></div>
+      <p class="hint" id="lib-detail"></p>
+      <div class="lib-grid" id="lib-grid" role="tabpanel" aria-labelledby="lib-h"></div>
+      <p class="hint">Tap a groove to load it into the section shown above. It replaces that section's drums, rolls, 808 line and synth part, and sets the tempo and swing (shared by every section). The other sections and their ▶ PLAY buttons aren't touched, and UNDO brings back what was there. All 32 are original 2-bar grooves written in each city's style; none copy a song.</p>
+    </section>
+
     <section class="panel">
       <div class="row">
         <h2 class="grotesk">STEP SEQUENCER <span id="seq-title">12 TRACKS × 16</span></h2>
@@ -658,6 +727,37 @@
         <button class="mini" id="insp-slide" type="button" aria-pressed="false">SLIDE</button>
       </div>
       <p id="toast"></p>
+    </section>
+
+    <section class="panel" id="synth-panel" aria-labelledby="syn-h">
+      <div class="row">
+        <h2 class="grotesk" id="syn-h">SYNTHS &amp; CHORDS <span>16 PRESETS · KEY · SCALE · PROGRESSIONS · VOICINGS · ARPS</span></h2>
+      </div>
+      <h3 class="sub-h">SYNTH <span class="hint" id="syn-name"></span></h3>
+      <div class="syn-grid" id="syn-grid" role="group" aria-label="Synth presets"></div>
+      <p class="hint" id="syn-detail"></p>
+      <div class="syn-edit" id="syn-edit" role="group" aria-label="Edit the selected synth"></div>
+      <h3 class="sub-h">CHORD MODE <span class="hint">CHORDS PLAY ON THE SYNTH TRACK, IN KEY</span></h3>
+      <div class="chord-form" id="chord-form">
+        <label>KEY <select id="ch-key"></select></label>
+        <label>SCALE <select id="ch-scale"></select></label>
+        <label>TYPE <select id="ch-type"></select></label>
+        <label>VOICING <select id="ch-voicing"></select></label>
+        <label>INVERSION <select id="ch-inv"></select></label>
+        <label>OCTAVE <select id="ch-oct"><option value="-1">low</option><option value="0">mid</option><option value="1">high</option></select></label>
+        <label>RHYTHM <select id="ch-rhythm"></select></label>
+        <label>STRUM <select id="ch-strum"></select></label>
+        <label>EACH CHORD <select id="ch-span"><option value="8">½ bar</option><option value="16">1 bar</option></select></label>
+        <label class="check"><input type="checkbox" id="ch-follow"> 808 FOLLOWS THE ROOT</label>
+      </div>
+      <p class="hint">PROGRESSION (tapping one also picks the scale it's usually heard in)</p>
+      <div class="prog-grid" id="prog-grid" role="group" aria-label="Progressions"></div>
+      <p class="chord-read" id="chord-read" aria-live="polite"></p>
+      <div class="controls chord-go">
+        <button class="btn" id="chord-hear" type="button">▶ HEAR</button>
+        <button class="btn on" id="chord-write" type="button">WRITE TO SECTION A</button>
+      </div>
+      <p class="hint">WRITE puts the progression on the Synth track of the section you're editing, using the selected synth. Every note stays in the key and scale. Arps play one chord note per step. With 808 FOLLOWS THE ROOT on, existing 808 notes move to each chord's root (to the nearest octave), and an empty 808 track gets one root note per chord. Undo reverts it. Synth edits are saved with the beat.</p>
     </section>
 
     <details class="panel" id="mixer-panel">

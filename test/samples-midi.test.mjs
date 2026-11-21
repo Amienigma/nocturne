@@ -41,9 +41,12 @@ test("samples: long input is cut to 10 s, high rates downsampled, silence reject
 });
 
 test("sample + TR-808 sources are appended last, so older share-link indexes don't move", () => {
-  // Phase 3b appended "Your samples"; the classic TR-808 kit is appended after it.
-  assert.equal(SOURCE_GROUPS[SOURCE_GROUPS.length - 2].label, "Your samples");
-  assert.equal(SOURCE_GROUPS[SOURCE_GROUPS.length - 1].label, "TR-808 classic");
+  // Phase 3b appended "Your samples"; the classic TR-808 kit is appended after
+  // it, and the Phase 4 synth presets after that.
+  assert.equal(SOURCE_GROUPS[SOURCE_GROUPS.length - 3].label, "Your samples");
+  assert.equal(SOURCE_GROUPS[SOURCE_GROUPS.length - 2].label, "TR-808 classic");
+  assert.equal(SOURCE_GROUPS[SOURCE_GROUPS.length - 1].label, "Synths");
+  assert.ok(SOURCE_IDS.indexOf("syn:darkbell") > SOURCE_IDS.indexOf("tr:BD"));
   assert.equal(SOURCE_IDS.indexOf("smp:1"), 79);
   assert.equal(SOURCE_IDS.indexOf("tr:BD"), 87);
   assert.equal(SOURCE_IDS.indexOf("pit:808"), 0);

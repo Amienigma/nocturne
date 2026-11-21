@@ -1,4 +1,5 @@
 /** Shared musical helpers from 808 PIT, plus NOCTURNE sequencer data. */
+import { SYNTH_PRESETS } from "./synths.mjs";
 
 export const WAVES = [
   { id: "sine", label: "Sine" },
@@ -308,6 +309,12 @@ export const SOURCE_GROUPS = [
     label: "TR-808 classic",
     items: TR808_VOICES.map((v) => ({ id: `tr:${v.id}`, label: v.label })),
   },
+  // Appended after the TR-808 voices: the synth presets (SYNTH panel). Chord
+  // steps on these tracks carry their own notes (cell.notes).
+  {
+    label: "Synths",
+    items: SYNTH_PRESETS.map((p) => ({ id: `syn:${p.id}`, label: `${p.label} (${p.group})` })),
+  },
 ];
 
 export function sampleSlotFromSource(source) {
@@ -331,8 +338,12 @@ export function sourceIsTr808(source) {
   return typeof source === "string" && source.startsWith("tr:");
 }
 
+export function sourceIsSyn(source) {
+  return typeof source === "string" && source.startsWith("syn:");
+}
+
 export function sourceIsMelodic(source) {
-  return sourceIsPit(source) || sourceIsN808(source) || sourceIsChord(source) || source === "tr:TOM";
+  return sourceIsPit(source) || sourceIsN808(source) || sourceIsChord(source) || sourceIsSyn(source) || source === "tr:TOM";
 }
 
 export function pitWaveFromSource(source) {
@@ -468,8 +479,10 @@ export function toggleStep(pattern, track, step, paint = {}) {
       if (cell.on && paint.forceOn == null) {
         return { ...cell, on: false };
       }
+      // Painting a single note replaces a written chord on that step.
+      const { notes, strum, ...plain } = cell; // eslint-disable-line no-unused-vars
       return {
-        ...cell,
+        ...(paint.note != null ? plain : cell),
         on: true,
         vel: paint.vel ?? cell.vel,
         note: paint.note ?? cell.note,
