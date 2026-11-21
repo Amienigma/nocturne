@@ -57,7 +57,7 @@ import {
   toStored,
   fromStored,
 } from "./src/state-io.mjs";
-import { layerHits, sanitizeLayers } from "./src/sequencer.mjs";
+import { layerHits, layerStep, sanitizeLayers } from "./src/sequencer.mjs";
 import { defaultLoopers, sanitizeLoopers, looperStep, looperHits, activeLoopers, applyLooperQueue, SECTION_LENS, SECTION_LEN_LABELS } from "./src/loopers.mjs";
 import { classicBanks, classicMixer, classicState, isLegacyStarter, CLASSIC_BPM, CLASSIC_SWING, CLASSIC_LENGTH, CLASSIC_CHAIN, CLASSIC_SECTIONS } from "./src/classics.mjs";
 import { SAMPLE_SLOTS, MAX_FILE_BYTES, MAX_SAMPLE_SEC, prepareSample, loadSamples, saveSample, deleteSample } from "./src/samples.mjs";
@@ -110,6 +110,9 @@ let layers = sanitizeLayers(null, TRACKS.length);
 
 const $ = (id) => document.getElementById(id);
 window.__nocturneState = state; // for tests/debugging
+// Shown in the footer so you can tell which version your phone is running.
+const APP_BUILD = "2026.11.21-p5";
+window.__nocturneBuild = APP_BUILD;
 
 // ---- Save, autosave, undo/redo -------------------------------------------
 const AUTOSAVE_KEY = "nocturne.autosave.v1";
@@ -730,6 +733,7 @@ function playHit(hit) {
     if (state.loopId === hit.id) {
       studio.stopLoop();
       state.loopId = null;
+      updateStopAll();
       renderBank();
       renderLcd();
       return;
@@ -739,12 +743,13 @@ function playHit(hit) {
     state.padHeld = null;
     studio.startLoop(hit.steps, hit.stepMs ?? 480, hit.gate ?? 0.8);
     state.loopId = hit.id;
+    updateStopAll();
     renderBank();
     renderLcd();
     return;
   }
-  studio.stopLoop();
-  state.loopId = null;
+  // Note / chord taps layer over a running chord loop (and over bed loops and
+  // sections); only another loop pad, CUT or STOP ALL changes the loop.
   for (const n of hit.notes ?? []) studio.down(n, `pad:${hit.id}`, 0.9, hit.tone.wave);
   state.padHeld = hit.id;
   if (sourceIsMelodic(state.pattern[state.selectedTrack]?.source)) {
@@ -812,6 +817,7 @@ function padButton(name, parent) {
     e.preventDefault();
     if (!arm()) return;
     studio.playNamed(name, studio.ctx.currentTime, 0.9);
+    overdubTap(name, 0.9);
     btn.classList.add("on");
     setTimeout(() => btn.classList.remove("on"), 140);
   });
@@ -1290,7 +1296,7 @@ function logSwitch(bank, why) {
   transportLog.push({ step: absStep, bank, song: state.song, why });
   if (transportLog.length > 64) transportLog.shift();
 }
-window.__nocturneTransport = () => ({ layers: layers.map((l) => ({ ...l })), layerQueue: [...layerQueue.keys()], syncQueued, playing: state.playing, absStep, stepIndex, songPos, loopers: loopers.map((l) => ({ ...l })), looperQueue: [...looperQueue].map(([bank, op]) => ({ bank, ...op })), queuedMode, bank: state.bank, song: state.song, log: transportLog.slice() });
+window.__nocturneTransport = () => ({ layers: layers.map((l) => ({ ...l })), layerQueue: [...layerQueue.keys()], syncQueued, playing: state.playing, absStep, nextTime, bpm: state.bpm, stepIndex, songPos, loopers: loopers.map((l) => ({ ...l })), looperQueue: [...looperQueue].map(([bank, op]) => ({ bank, ...op })), queuedMode, bank: state.bank, song: state.song, log: transportLog.slice() });
 const lightTimers = new Set();
 
 function outputDelay() {
@@ -1353,6 +1359,7 @@ function scheduler() {
       }
       if (bar && deckOpen()) queueUi(nextTime, renderCounters);
       if (bar && !state.song) queueUi(nextTime, renderLooperLive);
+      if (bar && overdub.on && absStep === overdub.from) queueUi(nextTime, renderOverdub);
     }
     // Song: the chain's current section. Otherwise every playing section looper,
     // layered; the grid's playhead follows the section you're editing.
@@ -1362,6 +1369,8 @@ function scheduler() {
     const when = nextTime + swing;
     const hits = state.song ? layerHits(state.pattern, layers, absStep, step, stepSec) : looperHits(state.banks, loopers, layers, absStep, stepSec, state.length);
     for (const h of hits) {
+      // A tap overdubbed onto a step that hadn't been scheduled yet was already heard live.
+      if (overdubSkip.size && overdubSkip.delete(`${h.bank ?? state.bank}:${h.track}:${absStep}`)) continue;
       studio.triggerSource(h.source, h.cell, when + h.at, h.vel, h.opts);
     }
     queueLight(step, when);
@@ -1382,8 +1391,7 @@ function setPlaying(on, startAt = null) {
   if (on && !arm()) return;
   state.playing = on;
   // The top-bar button only stops: sound starts from a section's own ▶ PLAY (or SONG).
-  $("play").disabled = !on;
-  $("play").classList.toggle("on", on);
+  updateStopAll();
   if (timer) {
     clearInterval(timer);
     timer = 0;
@@ -1413,6 +1421,8 @@ function setPlaying(on, startAt = null) {
     looperQueue.clear();
     queuedMode = null;
     renderBanks();
+    if (overdub.on) overdub.from = 0; // armed before PLAY: records from the first bar
+    renderOverdub();
     timer = window.setInterval(scheduler, 25);
     kickScope();
   } else {
@@ -1422,8 +1432,11 @@ function setPlaying(on, startAt = null) {
     looperQueue.clear();
     for (const l of loopers) l.on = false;
     queuedMode = null;
+    overdubSkip.clear();
+    if (overdub.on) overdub.from = null; // stays armed for the next PLAY
     renderBanks();
     renderDeck();
+    renderOverdub();
     // The AudioContext suspends itself once tails have rung out (studio idle check).
     studio.lastUse = performance.now();
   }
@@ -2139,6 +2152,7 @@ function renderSamples() {
       box.className = "smp";
       box.dataset.slot = String(slot);
       box.innerHTML = `<button class="pad" type="button" data-sact="play"><b>${slot}</b><small></small></button>
+        <div class="acts loop-acts"><button class="mini loop" type="button" data-sact="loop" aria-pressed="false">⟳ LOOP</button><button class="mini" type="button" data-sact="choke" aria-pressed="false">CHOKE</button></div>
         <div class="acts"><button class="mini rec" type="button" data-sact="rec">REC</button><button class="mini" type="button" data-sact="load">LOAD</button><button class="mini" type="button" data-sact="del">CLEAR</button></div>`;
       grid.appendChild(box);
     }
@@ -2161,6 +2175,22 @@ function renderSamples() {
     const del = box.querySelector('[data-sact="del"]');
     del.disabled = !rec;
     del.setAttribute("aria-label", `Clear sample ${slot}`);
+    const loopBtn = box.querySelector('[data-sact="loop"]');
+    const looping = studio.bedPlaying(slot);
+    const waiting = bedWaiting.has(slot);
+    loopBtn.disabled = !rec;
+    loopBtn.textContent = looping ? (waiting ? "⟳ WAIT" : "■ LOOP") : "⟳ LOOP";
+    loopBtn.classList.toggle("on", looping && !waiting);
+    loopBtn.classList.toggle("queued", waiting);
+    loopBtn.setAttribute("aria-pressed", String(looping));
+    loopBtn.setAttribute("aria-label", looping ? `Stop looping ${sampleLabel(slot)}` : `Loop ${sampleLabel(slot)} as a layer that keeps playing`);
+    const chokeBtn = box.querySelector('[data-sact="choke"]');
+    const choke = prefs.choke.includes(slot);
+    chokeBtn.disabled = !rec;
+    chokeBtn.classList.toggle("on", choke);
+    chokeBtn.setAttribute("aria-pressed", String(choke));
+    chokeBtn.setAttribute("aria-label", choke ? `Sample ${slot} pad taps cut each other (tap to let them overlap)` : `Sample ${slot} pad taps overlap (tap to make each tap cut the last)`);
+    box.classList.toggle("looping", looping);
   }
   // Show sample names in the track sound picker.
   for (const opt of $("trk-src").querySelectorAll('option[value^="smp:"]')) {
@@ -2193,7 +2223,8 @@ async function storeSample(slot, channels, rate, name) {
   }
   $("smp-status").textContent = `Sample ${slot}: ${rec.name}, ${prep.seconds.toFixed(1)} s${prep.truncated ? ` (cut to ${MAX_SAMPLE_SEC} s)` : ""}.`
     + (saved ? "" : " This browser won't store it, so it's gone after a reload.");
-  if (arm()) studio.playSample(slot, studio.ctx.currentTime + 0.02, 0.9);
+  // Preview the new sound, unless it's already looping as a bed (its loop restarted with the new audio).
+  if (arm() && !studio.bedPlaying(slot)) studio.playSample(slot, studio.ctx.currentTime + 0.02, 0.9, 0, { pad: true });
 }
 
 async function decodeInto(slot, arrayBuffer, name) {
@@ -2292,11 +2323,20 @@ async function initSamples() {
     if (!btn) return;
     const slot = Number(btn.closest(".smp").dataset.slot);
     const act = btn.dataset.sact;
-    if (act === "play" && arm()) studio.playSample(slot, studio.ctx.currentTime, 0.9);
+    if (act === "play" && arm()) {
+      // Pad taps overlay everything already playing (beds, sections, other pads).
+      studio.playSample(slot, studio.ctx.currentTime, 0.9, 0, { pad: true });
+      overdubTap(`smp:${slot}`, 0.9);
+    } else if (act === "loop") toggleBed(slot);
+    else if (act === "choke") toggleChoke(slot);
     else if (act === "rec") (micRec ? stopMic() : void startMic(slot));
     else if (act === "load") pickFile(slot);
     else if (act === "del") void clearSample(slot);
   });
+  for (const slot of prefs.choke) studio.setSampleChoke(slot, true);
+  studio.onBeds = () => { renderSamples(); updateStopAll(); };
+  $("overdub").addEventListener("click", toggleOverdub);
+  renderOverdub();
   renderSamples();
   const stored = await loadSamples();
   for (const [slot, rec] of stored) {
@@ -2305,6 +2345,135 @@ async function initSamples() {
   }
   renderSamples();
 }
+
+// ---- Layering over uploads: bed loops, polyphonic pads, overdub ----
+// An upload (or mic take) can loop continuously as a "bed". Beds live outside
+// the sequencer: pad taps, section ▶ PLAY / stop, pattern loads, CUT and
+// recording never touch them; only the pad's own ■ LOOP toggle or ■ STOP ALL
+// ends one. While the beat runs, a bed starts on the next bar line so it lands
+// in time with the sections.
+const bedWaiting = new Set(); // slots whose bed is queued for the next bar
+
+/** Audio time of the next bar line, or null when the transport is stopped. */
+function nextBarTime() {
+  if (!state.playing || !studio.ctx) return null;
+  const stepSec = 60 / state.bpm / 4;
+  const toBar = (BAR_STEPS - (absStep % BAR_STEPS)) % BAR_STEPS;
+  return Math.max(studio.ctx.currentTime + 0.01, nextTime + toBar * stepSec);
+}
+
+function toggleBed(slot) {
+  if (!sampleRecs.has(slot) || !arm()) return;
+  if (studio.bedPlaying(slot)) {
+    bedWaiting.delete(slot);
+    studio.stopBed(slot);
+    return;
+  }
+  const when = nextBarTime();
+  if (when != null && when - studio.ctx.currentTime > 0.03) {
+    bedWaiting.add(slot);
+    window.setTimeout(() => { bedWaiting.delete(slot); renderSamples(); }, Math.max(0, (when + outputDelay() - studio.ctx.currentTime) * 1000));
+  }
+  studio.startBed(slot, when);
+  $("smp-status").textContent = `${sampleLabel(slot)} is looping${when != null ? " from the next bar" : ""}. Tap pads, play sections or load patterns on top; tap ■ LOOP again or ■ STOP ALL to stop it.`;
+}
+
+function toggleChoke(slot) {
+  const on = !prefs.choke.includes(slot);
+  prefs.choke = on ? [...prefs.choke, slot].sort() : prefs.choke.filter((x) => x !== slot);
+  studio.setSampleChoke(slot, on);
+  savePrefs();
+  renderSamples();
+}
+
+const anythingPlaying = () => state.playing || studio.beds.size > 0 || state.loopId != null || overdub.on;
+
+function updateStopAll() {
+  const any = anythingPlaying();
+  $("play").disabled = !any;
+  $("play").classList.toggle("on", any);
+}
+
+function stopAll() {
+  cancelCountIn();
+  if (state.playing) setPlaying(false);
+  bedWaiting.clear();
+  studio.stopBeds();
+  if (state.loopId != null) {
+    studio.stopLoop();
+    state.loopId = null;
+    renderBank();
+    renderLcd();
+  }
+  overdub.on = false;
+  overdub.from = null;
+  renderOverdub();
+  renderSamples();
+  updateStopAll();
+}
+
+// OVERDUB: taps on the sample pads and drum pads are written into the section
+// you hear, quantised to the nearest 16th, from the next bar line on, without
+// stopping or restarting anything. Each tap is also heard live right away.
+const overdub = { on: false, from: null }; // from = absStep the take starts at
+const overdubSkip = new Set(); // "bank:track:absStep" already heard live
+
+function toggleOverdub() {
+  if (overdub.on) {
+    overdub.on = false;
+    overdub.from = null;
+  } else {
+    if (!arm()) return;
+    overdub.on = true;
+    overdub.from = state.playing ? absStep + ((BAR_STEPS - (absStep % BAR_STEPS)) % BAR_STEPS) : null;
+  }
+  renderOverdub();
+  updateStopAll();
+}
+
+function renderOverdub() {
+  const btn = $("overdub");
+  if (!btn) return;
+  const live = overdub.on && state.playing && overdub.from != null && absStep >= overdub.from;
+  btn.classList.toggle("on", overdub.on);
+  btn.setAttribute("aria-pressed", String(overdub.on));
+  btn.textContent = overdub.on ? "● OVERDUB" : "○ OVERDUB";
+  btn.title = overdub.on ? (live ? "Recording taps into the playing section" : "Armed: starts at the next bar line") : "Record pad taps into the playing section without stopping it";
+}
+
+/**
+ * Write a live tap of sound `source` into the section that's playing, on the
+ * nearest step. Returns { bank, track, step } or null when nothing was written.
+ */
+function overdubTap(source, vel) {
+  if (!overdub.on || !state.playing || !studio.ctx || overdub.from == null) return null;
+  const stepSec = 60 / state.bpm / 4;
+  const pos = absStep - (nextTime - studio.ctx.currentTime) / stepSec;
+  const abs = Math.round(pos);
+  if (abs < overdub.from) return null;
+  const bank = state.song ? state.bank : loopers[state.bank]?.on ? state.bank : activeLoopers(loopers)[0];
+  if (bank == null) return null;
+  const pat = state.banks[bank];
+  let track = pat.findIndex((r) => r.source === source);
+  if (track < 0) track = pat.findIndex((r) => r.steps.slice(0, state.length).every((c) => !c.on));
+  if (track < 0) {
+    showSnack("OVERDUB: no free track for that sound. Clear a track or set one to it.");
+    return null;
+  }
+  const globalStep = state.song ? ((((stepIndex - (absStep - abs)) % state.length) + state.length) % state.length)
+    : looperStep(loopers[bank], abs, state.length);
+  const step = layerStep(layers[track], abs, globalStep);
+  commit(() => {
+    let next = pat;
+    if (next[track].source !== source) next = next.map((r, i) => (i === track ? { ...r, source } : r));
+    state.banks[bank] = setStepProps(next, track, step, { on: true, vel: Math.round(Math.min(1, Math.max(0.05, vel)) * 100) / 100 });
+  });
+  if (abs >= absStep) overdubSkip.add(`${bank}:${track}:${abs}`);
+  if (bank === state.bank) { renderSeq(); renderInspector(); }
+  renderOverdub();
+  return { bank, track, step };
+}
+window.__nocturneLayers = () => ({ beds: [...studio.beds.keys()], waiting: [...bedWaiting], padVoices: [...studio.padVoices].map(([s, v]) => [s, v.size]), overdub: { ...overdub }, choke: [...studio.sampleChoke], ctx: studio.ctx?.state ?? null });
 
 // ---- MIDI input (Web MIDI; not available on iPhone/iPad Safari) ----
 let midiOn = false;
@@ -2606,10 +2775,9 @@ function bind() {
   });
   // STOP ALL: stops every section looper (and the song). Starting sound is
   // always a section's own ▶ PLAY, SONG, or the tape deck.
-  $("play").addEventListener("click", () => {
-    cancelCountIn();
-    if (state.playing) setPlaying(false);
-  });
+  // STOP ALL is the one control that stops everything: section loopers, the
+  // song, every bed loop, the chord-loop pad and overdub.
+  $("play").addEventListener("click", stopAll);
   $("limiter").addEventListener("click", () => {
     commit(() => { state.limiter = !state.limiter; });
     studio.setLimiter(state.limiter);
@@ -2643,9 +2811,10 @@ function bind() {
     await toggleRec();
   });
   $("cut").addEventListener("click", () => {
-    studio.allOff();
+    studio.allOff(); // held notes + chord loop only; beds and sections keep going
     state.padHeld = null;
     state.loopId = null;
+    updateStopAll();
     renderBank();
     renderLcd();
   });
@@ -2701,12 +2870,14 @@ function bind() {
       // Space = the selected section's own ▶ PLAY; while playing it stops everything.
       e.preventDefault();
       cancelCountIn();
-      if (state.playing) setPlaying(false);
+      if (anythingPlaying()) stopAll();
       else sectionPlay(state.bank);
       return;
     }
     if (key === "escape") {
-      studio.allOff();
+      studio.allOff(); // held notes + chord loop only; beds and sections keep going
+      state.loopId = null;
+      updateStopAll();
       return;
     }
     if (key === "[" || key === "]") {
@@ -2759,6 +2930,8 @@ const prefs = (() => {
     city: CITIES.some((c) => c.id === raw.city) ? raw.city : "ATL",
     synth: synthById(raw.synth) ? raw.synth : "keys",
     chords: sanitizeChordSettings(raw.chords),
+    // Sample pads whose taps self-choke (default: none, so taps overlap).
+    choke: Array.isArray(raw.choke) ? [...new Set(raw.choke.filter((x) => Number.isInteger(x) && x >= 1 && x <= SAMPLE_SLOTS))] : [],
   };
 })();
 function savePrefs() {
@@ -3149,11 +3322,34 @@ window.addEventListener("hashchange", () => { void loadShareFromHash(); });
 $("export").addEventListener("click", () => { void exportWav(); });
 $("ai-form").addEventListener("submit", (e) => { void writeBeat(e); });
 // Offline support (PWA). Skipped on file:// and when service workers are unavailable.
+// The worker is network-first and bypasses the HTTP cache, so a deploy shows up
+// on the next load; when a new worker takes over an already-open page, a toast
+// offers a one-tap refresh. Coming back to the app checks for an update (an
+// event, not a timer, so nothing runs while idle).
 if ("serviceWorker" in navigator && location.protocol !== "file:") {
   window.addEventListener("load", () => {
-    navigator.serviceWorker.register("./sw.js").catch(() => { /* offline mode just isn't available */ });
+    const hadController = Boolean(navigator.serviceWorker.controller);
+    navigator.serviceWorker.register("./sw.js", { updateViaCache: "none" }).then((reg) => {
+      let lastCheck = Date.now();
+      document.addEventListener("visibilitychange", () => {
+        if (document.hidden || Date.now() - lastCheck < 60000) return;
+        lastCheck = Date.now();
+        reg.update().catch(() => {});
+      });
+    }).catch(() => { /* offline mode just isn't available */ });
+    navigator.serviceWorker.addEventListener("controllerchange", () => {
+      if (hadController) showUpdateToast();
+    });
   });
 }
+
+function showUpdateToast() {
+  const el = $("update-toast");
+  if (!el || !el.hidden) return;
+  el.hidden = false;
+  el.addEventListener("click", () => location.reload(), { once: true });
+}
+$("build-tag").textContent = `build ${APP_BUILD}`;
 void loadShareFromHash();
 if (!restored && !fromLink) {
   showSnack(legacyReplaced

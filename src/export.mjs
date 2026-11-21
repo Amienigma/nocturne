@@ -48,7 +48,7 @@ export function scheduleSteps(state, bars, startAt = 0, rng = seededRng(1), laye
  * Render `bars` bars to WAV.
  * @returns {Promise<{blob: Blob, seconds: number, peak: number, channels: Float32Array[]}>}
  */
-export async function renderWav(state, { bars = 4, bitDepth = 16, masterGain = 0.85, samples = null, tape = false, layers = null, loopers = null, onProgress = () => {} } = {}) {
+export async function renderWav(state, { bars = 4, bitDepth = 16, masterGain = 0.85, samples = null, tape = false, layers = null, loopers = null, beds = null, onStudio = null, onProgress = () => {} } = {}) {
   const Ctor = globalThis.OfflineAudioContext || globalThis.webkitOfflineAudioContext;
   if (!Ctor) throw new Error("This browser can't render audio offline");
   const music = (60 / state.bpm / 4) * exportSteps(state, bars);
@@ -71,6 +71,13 @@ export async function renderWav(state, { bars = 4, bitDepth = 16, masterGain = 0
   // Metronome stays silent: metroBus gain is 0 and no clicks are scheduled.
   const start = 0.02;
   const events = scheduleSteps(state, bars, start, seededRng(1), layers, loopers);
+  // Bed loops (uploads looping as layers) run from the first downbeat; they
+  // stop with the music so the tail is only reverb. `onStudio` lets tests add
+  // live gestures (pad taps) on top.
+  for (const slot of beds || []) {
+    if (s.startBed(slot, start)) s.stopBed(slot, start + music);
+  }
+  if (onStudio) onStudio(s, start, music);
   let next = 0;
   const scheduleUntil = (t) => {
     while (next < events.length && events[next].when < t) {

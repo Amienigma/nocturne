@@ -3,11 +3,16 @@
 // picked up on the next load and files never mix versions), falling back to
 // the cache only when offline or the network stalls. Bump VERSION when the
 // shell file list changes; old caches are deleted on activate.
-const VERSION = "v8";
+// Network requests bypass the browser HTTP cache (cache: "no-cache" revalidates
+// with the server), because GitHub Pages sends max-age=600: without this a
+// "network-first" fetch could still hand back a 10-minute-old app.js.
+const VERSION = "v9-2026.11.21-p5";
 const CACHE = `nocturne-shell-${VERSION}`;
 const SHELL = [
   "./", // not "./index.html": hosts with clean URLs (Vercel) redirect it
   "./app.js",
+  "./app.js?v=2026.11.21-p5",
+  "./fonts/fonts.css?v=2026.11.21-p5",
   "./manifest.webmanifest",
   "./src/audio.mjs",
   "./src/music.mjs",
@@ -28,11 +33,22 @@ const SHELL = [
   "./fonts/space-grotesk-latin.woff2",
   "./fonts/saira-xc-600-latin.woff2",
   "./fonts/saira-xc-800-latin.woff2",
+  "./icons/icon-48.png",
+  "./icons/icon-72.png",
+  "./icons/icon-96.png",
+  "./icons/icon-128.png",
+  "./icons/icon-144.png",
+  "./icons/icon-152.png",
   "./icons/icon-192.png",
+  "./icons/icon-256.png",
+  "./icons/icon-384.png",
   "./icons/icon-512.png",
+  "./icons/icon-maskable-192.png",
   "./icons/icon-maskable-512.png",
   "./icons/apple-touch-icon.png",
   "./icons/favicon-32.png",
+  "./icons/favicon-16.png",
+  "./favicon.ico",
 ];
 const NETWORK_TIMEOUT_MS = 4000;
 
@@ -64,7 +80,9 @@ self.addEventListener("fetch", (event) => {
   event.respondWith((async () => {
     const cache = await caches.open(CACHE);
     try {
-      const res = await Promise.race([fetch(req), timeout(NETWORK_TIMEOUT_MS)]);
+      // Navigations can't be re-wrapped with an init, so refetch them by URL.
+      const fresh = req.mode === "navigate" ? fetch(req.url, { cache: "no-cache", credentials: "same-origin" }) : fetch(req, { cache: "no-cache" });
+      const res = await Promise.race([fresh, timeout(NETWORK_TIMEOUT_MS)]);
       if (res && res.ok && res.type === "basic") cache.put(req, res.clone());
       return res;
     } catch {

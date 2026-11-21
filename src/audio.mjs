@@ -127,6 +127,7 @@ export function foldSub(hz, floor = SUB_FLOOR_HZ) {
 }
 
 export class Studio {
+  static PAD_POLY = 6; // pad taps per sample slot that may ring at once
   constructor() {
     this.ctx = null;
     this.master = null;
@@ -162,6 +163,13 @@ export class Studio {
     this.trackHz = new Map();
     this.sampleRecs = new Map(); // slot (1-8) -> { name, rate, pcm }
     this.samples = new Map(); // slot -> AudioBuffer for this.ctx (built on first use)
+    // Bed loops: an uploaded / recorded sample looping continuously as a layer.
+    // Beds never take part in chokes, CUT, pad taps, section starts or pattern
+    // loads; only stopBeds() (STOP ALL) or the pad's own LOOP toggle ends one.
+    this.beds = new Map(); // slot -> { src, g, start }
+    this.sampleChoke = new Set(); // slots whose pad taps self-choke (off by default)
+    this.padVoices = new Map(); // slot -> live pad-tap voices (polyphony cap)
+    this.onBeds = () => {};
     this.limiterOn = true;
     this.tapeOn = false; // TAPE: wow/flutter + saturation + hiss, before the safety stage
     this.tape = null;
@@ -476,7 +484,7 @@ export class Studio {
   }
 
   canSleep() {
-    return !this.keepAwake && !this.recorder && this.voices.size === 0 &&
+    return !this.keepAwake && !this.recorder && this.voices.size === 0 && this.beds.size === 0 &&
       !this.stepTimer && Object.keys(this.ambience).length === 0;
   }
 
@@ -506,7 +514,7 @@ export class Studio {
       void this.suspendFaded();
     } else {
       this.hiddenSuspend = false;
-      if (this.keepAwake && this.ctx.state !== "running") {
+      if ((this.keepAwake || this.beds.size) && this.ctx.state !== "running") {
         this.resumeFaded();
         this.lastUse = performance.now();
         this.armIdleCheck();
@@ -1994,9 +2002,17 @@ export class Studio {
 
   /** Install (or remove with null) a user sample record { name, rate, pcm: Int16Array }. */
   setSample(slot, rec) {
+    // A bed keeps its own AudioBuffer reference, so loading a new file into
+    // another slot never touches it; replacing / clearing *this* slot restarts
+    // (or ends) its bed with the new audio.
+    const bed = this.beds.get(slot);
     this.samples.delete(slot);
     if (rec) this.sampleRecs.set(slot, rec);
     else this.sampleRecs.delete(slot);
+    if (bed && this.ctx) {
+      if (rec) this.startBed(slot, null, bed.vel);
+      else this.stopBed(slot);
+    }
   }
 
   sampleBuffer(slot) {
@@ -2010,10 +2026,14 @@ export class Studio {
     return buf;
   }
 
-  // One-shot sample voice. Samples are stored normalised to -6 dBFS; a new
-  // hit on the same slot chokes the last one (mono, like an MPC pad), so
-  // rolls never stack up.
-  playSample(slot, when, velocity = 0.9, gate = 0) {
+  // One-shot sample voice. Samples are stored normalised to -6 dBFS.
+  // Pad taps (`opts.pad`) overlay polyphonically, so tapping never cuts what an
+  // upload is already playing; a pad only self-chokes when its CHOKE option is
+  // on (sampleChoke), and at most PAD_POLY taps per slot ring at once (oldest
+  // fades out) so stacking stays cheap. Sequenced hits stay mono per slot in
+  // their own choke group ("seq-smp:N"), so rolls never pile up, and they never
+  // cut a pad tap or a bed loop.
+  playSample(slot, when, velocity = 0.9, gate = 0, opts = {}) {
     if (!this.arm()) return;
     const buf = this.sampleBuffer(slot);
     if (!buf) return;
@@ -2034,11 +2054,98 @@ export class Studio {
     }
     src.start(when);
     src.stop(when + dur + 0.02);
+    const stopAll = (t) => { try { src.stop(t); } catch { /* done */ } };
+    const voice = { chk, stopAll, src };
+    // Keep the context awake while a long upload rings (up to 10 s).
+    this.lastUse = Math.max(this.lastUse, (typeof performance !== "undefined" ? performance.now() : 0) + (when - C.currentTime + dur) * 1000);
+    if (opts.pad) {
+      let live = this.padVoices.get(slot);
+      if (!live) { live = new Set(); this.padVoices.set(slot, live); }
+      if (this.sampleChoke.has(slot)) {
+        for (const v of live) this.fadeVoice(v, when);
+      } else if (live.size >= Studio.PAD_POLY) {
+        this.fadeVoice(live.values().next().value, when);
+      }
+      live.add(voice);
+      src.addEventListener("ended", () => { live.delete(voice); });
+    } else {
+      this.choke(`seq-smp:${slot}`, when, chk, stopAll);
+    }
     src.addEventListener("ended", () => {
       try { g.disconnect(); } catch { /* gone */ }
       try { chk.disconnect(); } catch { /* gone */ }
     });
-    this.choke(`smp:${slot}`, when, chk, (t) => { try { src.stop(t); } catch { /* done */ } });
+  }
+
+  fadeVoice(v, when) {
+    if (!v) return;
+    const t = Math.max(when, this.ctx.currentTime);
+    try {
+      v.chk.gain.setValueAtTime(1, t);
+      v.chk.gain.linearRampToValueAtTime(0, t + 0.012);
+    } catch { /* gone */ }
+    v.stopAll(t + 0.03);
+    for (const live of this.padVoices.values()) live.delete(v);
+  }
+
+  setSampleChoke(slot, on) {
+    if (on) this.sampleChoke.add(slot);
+    else this.sampleChoke.delete(slot);
+  }
+
+  // ---- Bed loops (an upload looping as a layer) -------------------------------
+  bedPlaying(slot) {
+    return this.beds.has(slot);
+  }
+
+  /** Start sample `slot` looping from audio time `when` (e.g. the next bar line). */
+  startBed(slot, when = null, velocity = 0.8) {
+    if (!this.arm()) return false;
+    const buf = this.sampleBuffer(slot);
+    if (!buf) return false;
+    this.stopBed(slot);
+    const C = this.ctx;
+    const t = Math.max(C.currentTime, when ?? C.currentTime);
+    const src = C.createBufferSource();
+    src.buffer = buf;
+    src.loop = true;
+    const g = C.createGain();
+    const vel = Math.min(1, Math.max(0.05, velocity));
+    g.gain.setValueAtTime(0, t);
+    g.gain.linearRampToValueAtTime(vel, t + 0.006);
+    src.connect(g).connect(this.busFor("Samples"));
+    src.start(t);
+    const bed = { src, g, start: t, vel };
+    this.beds.set(slot, bed);
+    src.addEventListener("ended", () => {
+      try { g.disconnect(); } catch { /* gone */ }
+      if (this.beds.get(slot) === bed) this.beds.delete(slot);
+    });
+    this.lastUse = typeof performance !== "undefined" ? performance.now() : 0;
+    this.onBeds();
+    return true;
+  }
+
+  stopBed(slot, when = null) {
+    const bed = this.beds.get(slot);
+    if (!bed) return false;
+    this.beds.delete(slot);
+    const C = this.ctx;
+    const t = Math.max(C.currentTime, when ?? C.currentTime, bed.start);
+    try {
+      bed.g.gain.cancelScheduledValues(t);
+      // A stop scheduled ahead (export) fades from the bed's level, not today's value.
+      bed.g.gain.setValueAtTime(t > C.currentTime + 0.001 ? bed.vel : bed.g.gain.value, t);
+      bed.g.gain.linearRampToValueAtTime(0, t + 0.015);
+      bed.src.stop(t + 0.03);
+    } catch { /* already stopped */ }
+    this.lastUse = typeof performance !== "undefined" ? performance.now() : 0;
+    this.onBeds();
+    return true;
+  }
+
+  stopBeds() {
+    for (const slot of [...this.beds.keys()]) this.stopBed(slot);
   }
 
   playNamed(name, when, velocity = 0.9) {
